@@ -56,12 +56,9 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     if !sig.inputs.is_empty() {
-        return syn::Error::new_spanned(
-            &sig.inputs,
-            "the main function cannot have parameters",
-        )
-        .to_compile_error()
-        .into();
+        return syn::Error::new_spanned(&sig.inputs, "the main function cannot have parameters")
+            .to_compile_error()
+            .into();
     }
 
     // Generate the expanded code

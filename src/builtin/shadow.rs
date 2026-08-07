@@ -853,7 +853,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts,
+                buffers: &vertex_buffer_layouts.map(Some),
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -969,7 +969,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts,
+                buffers: &vertex_buffer_layouts.map(Some),
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -1100,7 +1100,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts,
+                buffers: &vertex_buffer_layouts.map(Some),
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1244,7 +1244,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts,
+                buffers: &vertex_buffer_layouts.map(Some),
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {

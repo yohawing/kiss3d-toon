@@ -384,7 +384,7 @@ impl HdrPipeline {
                 vertex: wgpu::VertexState {
                     module: &bloom_shader,
                     entry_point: Some("vs_main"),
-                    buffers: std::slice::from_ref(&vertex_layout),
+                    buffers: &[Some(vertex_layout.clone())],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -559,7 +559,7 @@ impl HdrPipeline {
             vertex: wgpu::VertexState {
                 module: &tonemap_shader,
                 entry_point: Some("vs_main"),
-                buffers: std::slice::from_ref(&vertex_layout),
+                buffers: &[Some(vertex_layout.clone())],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -936,7 +936,7 @@ impl HdrPipeline {
             vertex: wgpu::VertexState {
                 module: &oit_shader,
                 entry_point: Some("vs_main"),
-                buffers: std::slice::from_ref(&vertex_layout),
+                buffers: &[Some(vertex_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {

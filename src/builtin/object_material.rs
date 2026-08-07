@@ -1252,14 +1252,14 @@ impl ObjectMaterial {
                 // not vertex attributes. `skinned` only selects the shader + layout.
                 let _ = skinned;
                 let plain_layouts = surface_vertex_buffer_layouts();
-                let buffers: &[wgpu::VertexBufferLayout] = &plain_layouts;
+                let buffers = plain_layouts.map(Some);
                 ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
                     layout: Some(layout),
                     vertex: wgpu::VertexState {
                         module: shader,
                         entry_point: Some("vs_main"),
-                        buffers,
+                        buffers: &buffers,
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -1314,14 +1314,14 @@ impl ObjectMaterial {
                 // not vertex attributes. `skinned` only selects the shader + layout.
                 let _ = skinned;
                 let plain_layouts = surface_vertex_buffer_layouts();
-                let buffers: &[wgpu::VertexBufferLayout] = &plain_layouts;
+                let buffers = plain_layouts.map(Some);
                 ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
                     layout: Some(layout),
                     vertex: wgpu::VertexState {
                         module: shader,
                         entry_point: Some("vs_main"),
-                        buffers,
+                        buffers: &buffers,
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -1401,14 +1401,14 @@ impl ObjectMaterial {
                 // not vertex attributes. `skinned` only selects the shader + layout.
                 let _ = skinned;
                 let plain_layouts = surface_vertex_buffer_layouts();
-                let buffers: &[wgpu::VertexBufferLayout] = &plain_layouts;
+                let buffers = plain_layouts.map(Some);
                 ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("object_material_prepass_pipeline"),
                     layout: Some(layout),
                     vertex: wgpu::VertexState {
                         module: shader,
                         entry_point: Some("vs_main"),
-                        buffers,
+                        buffers: &buffers,
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -1705,7 +1705,7 @@ impl ObjectMaterial {
                 vertex: wgpu::VertexState {
                     module: &wireframe_polyline_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &wireframe_instance_buffer_layouts,
+                    buffers: &wireframe_instance_buffer_layouts.map(Some),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1876,7 +1876,7 @@ impl ObjectMaterial {
                 vertex: wgpu::VertexState {
                     module: &points_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &points_instance_buffer_layouts,
+                    buffers: &points_instance_buffer_layouts.map(Some),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

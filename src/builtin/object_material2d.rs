@@ -602,7 +602,7 @@ impl ObjectMaterial2d {
                 vertex: wgpu::VertexState {
                     module: &wireframe_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &wireframe_instance_buffer_layouts,
+                    buffers: &wireframe_instance_buffer_layouts.map(Some),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -766,7 +766,7 @@ impl ObjectMaterial2d {
                 vertex: wgpu::VertexState {
                     module: &points_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &points_instance_buffer_layouts,
+                    buffers: &points_instance_buffer_layouts.map(Some),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -957,7 +957,7 @@ impl ObjectMaterial2d {
                     vertex: wgpu::VertexState {
                         module: &shader,
                         entry_point: Some("vs_main"),
-                        buffers: &vertex_buffer_layouts,
+                        buffers: &vertex_buffer_layouts.map(Some),
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {

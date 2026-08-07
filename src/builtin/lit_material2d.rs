@@ -286,7 +286,7 @@ impl LitMaterial2d {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &vertex_buffer_layouts,
+                    buffers: &vertex_buffer_layouts.map(Some),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

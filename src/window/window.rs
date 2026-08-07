@@ -226,6 +226,14 @@ impl Window {
         &mut self.canvas
     }
 
+    /// Queues an event supplied by an embedding host.
+    ///
+    /// Embedded windows do not own a winit event loop, so mouse, keyboard and
+    /// focus events must be forwarded explicitly before the next render call.
+    pub fn push_event(&self, event: WindowEvent) {
+        self.canvas.push_event(event)
+    }
+
     #[cfg(feature = "rt_switcher")]
     pub fn raytracer_mut(&mut self) -> Option<&mut RayTracer> {
         self.raytracer.0.as_mut()
@@ -1058,6 +1066,81 @@ impl Window {
     /// themselves and never present to a display.
     pub async fn new_headless_with_setup(width: u32, height: u32, setup: CanvasSetup) -> Window {
         Self::do_new_headless(width, height, Some(setup)).await
+    }
+
+    /// Creates a full-featured window on a surface supplied by an embedding
+    /// application, without creating or polling a winit event loop.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn new_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        setup: CanvasSetup,
+    ) -> Window
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        let (event_send, event_receive) = mpsc::channel();
+        let canvas =
+            Canvas::open_embedded(surface_target, width, height, Some(setup), event_send).await;
+        let (width, height) = canvas.size();
+        let canvas_surface_format = canvas.surface_format();
+
+        Context::increment_window_count();
+        WindowCache::populate();
+
+        let framebuffer_manager = FramebufferManager::new();
+        Window {
+            should_close: false,
+            first_frame: true,
+            close_key: None,
+            close_modifiers: None,
+            last_timings: None,
+            last_frame_instant: None,
+            gpu_timer: GpuTimer::new(),
+            canvas,
+            events: Rc::new(event_receive),
+            unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            ambient_intensity: 0.2,
+            ambient_color: crate::color::WHITE,
+            fog: crate::light::Fog::default(),
+            background: BLACK,
+            polyline_renderer_2d: PolylineRenderer2d::new(),
+            point_renderer_2d: PointRenderer2d::new(),
+            point_renderer: PointRenderer3d::new(),
+            polyline_renderer: PolylineRenderer3d::new(),
+            text_renderer: TextRenderer::new(),
+            #[cfg(feature = "egui")]
+            egui_context: EguiContext::new(),
+            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            skybox: crate::renderer::Skybox::new(),
+            ssao: None,
+            ssao_enabled: false,
+            clustered: None,
+            reflection_probes: None,
+            probe_capture: None,
+            pending_probe_captures: Vec::new(),
+            reflection_capture_layers: u32::MAX,
+            ssr: None,
+            ssr_enabled: false,
+            dof: None,
+            dof_enabled: false,
+            transmission: None,
+            transmission_enabled: true,
+            reflector_oit: None,
+            post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
+            post_process_render_target_b: framebuffer_manager
+                .new_render_target(width, height, false),
+            offscreen_output_target: None,
+            aov_renderer: None,
+            hidden: false,
+            shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
+            framebuffer_manager,
+            #[cfg(feature = "recording")]
+            recording: None,
+            #[cfg(feature = "rt_switcher")]
+            raytracer: (None, false),
+        }
     }
 
     /// Creates a headless window: a render target backed by no actual window,

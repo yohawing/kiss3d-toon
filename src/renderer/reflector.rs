@@ -400,7 +400,7 @@ impl ReflectorOit {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: std::slice::from_ref(&vertex_layout),
+                buffers: &[Some(vertex_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {

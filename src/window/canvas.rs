@@ -95,9 +95,38 @@ impl Canvas {
         }
     }
 
+    /// Opens a canvas on a surface supplied by an embedding application.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Self
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        Canvas {
+            canvas: WgpuCanvas::open_embedded(
+                surface_target,
+                width,
+                height,
+                canvas_setup,
+                out_events,
+            )
+            .await,
+        }
+    }
+
     /// Poll all events that occurred since the last call to this method.
     pub fn poll_events(&mut self) {
         self.canvas.poll_events()
+    }
+
+    /// Queues an event supplied by an embedding host.
+    pub fn push_event(&self, event: WindowEvent) {
+        self.canvas.push_event(event)
     }
 
     /// Resizes the canvas render targets.

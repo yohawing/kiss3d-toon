@@ -287,6 +287,7 @@ impl WgpuCanvas {
                     power_preference: wgpu::PowerPreference::default(),
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .expect("Failed to find an appropriate adapter");
@@ -358,6 +359,7 @@ impl WgpuCanvas {
             height,
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -689,6 +691,145 @@ impl WgpuCanvas {
         }
     }
 
+    /// Opens a canvas on a surface owned by an embedding application.
+    ///
+    /// Unlike [`Self::open`], this does not create or poll a winit event loop.
+    /// The embedder remains responsible for the native window lifetime, resize
+    /// notifications and input delivery through [`Self::push_event`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Self
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        let canvas_setup = canvas_setup.unwrap_or_default();
+        let width = width.max(1);
+        let height = height.max(1);
+
+        let (surface, surface_format) = if Context::is_initialized() {
+            let ctxt = Context::get();
+            let surface = ctxt
+                .instance
+                .create_surface(surface_target)
+                .expect("Failed to create embedded surface");
+            let surface_caps = surface.get_capabilities(&ctxt.adapter);
+            let enabled_features = ctxt.device.features();
+            let surface_format = surface_caps
+                .formats
+                .iter()
+                .find(|format| {
+                    !format.is_srgb() && enabled_features.contains(format.required_features())
+                })
+                .copied()
+                .unwrap_or(surface_caps.formats[0]);
+            (surface, surface_format)
+        } else {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let surface = instance
+                .create_surface(surface_target)
+                .expect("Failed to create embedded surface");
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::default(),
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .expect("Failed to find an adapter for the embedded surface");
+            let required_features = device_features(&adapter, canvas_setup.required_features);
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("kiss3d embedded device"),
+                    required_features,
+                    required_limits: adapter.limits(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                    experimental_features: experimental_features(required_features),
+                })
+                .await
+                .expect("Failed to create the embedded device");
+            let surface_caps = surface.get_capabilities(&adapter);
+            let enabled_features = device.features();
+            let surface_format = surface_caps
+                .formats
+                .iter()
+                .find(|format| {
+                    !format.is_srgb() && enabled_features.contains(format.required_features())
+                })
+                .copied()
+                .unwrap_or(surface_caps.formats[0]);
+            Context::init(instance, device, queue, adapter, surface_format);
+            (surface, surface_format)
+        };
+
+        let ctxt = Context::get();
+        let surface_caps = surface.get_capabilities(&ctxt.adapter);
+        let present_mode = if canvas_setup.vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format: surface_format,
+            width,
+            height,
+            present_mode,
+            alpha_mode: surface_caps.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&ctxt.device, &surface_config);
+
+        let sample_count = canvas_setup.samples as u32;
+        let (depth_texture, depth_view) =
+            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+        let (msaa_texture, msaa_view) = if sample_count > 1 {
+            let (texture, view) = Self::create_msaa_texture(
+                &ctxt.device,
+                width,
+                height,
+                surface_format,
+                sample_count,
+            );
+            (Some(texture), Some(view))
+        } else {
+            (None, None)
+        };
+        let readback_texture =
+            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
+
+        WgpuCanvas {
+            window: None,
+            window_id: None,
+            surface: Some(surface),
+            surface_config,
+            cursor_pos: None,
+            key_states: [Action::Release; Key::Unknown as usize + 1],
+            button_states: [Action::Release; MouseButton::Button8 as usize + 1],
+            out_events,
+            modifiers_state: ModifiersState::default(),
+            depth_texture,
+            depth_view,
+            msaa_texture,
+            msaa_view,
+            sample_count,
+            readback_texture,
+            screenshot_staging: RefCell::new(None),
+            snap_pending: RefCell::new(None),
+        }
+    }
+
     /// Opens a headless canvas: a wgpu context with no window and no surface,
     /// for off-screen rendering. Works without a display server.
     pub async fn open_headless(
@@ -716,6 +857,7 @@ impl WgpuCanvas {
                     power_preference: wgpu::PowerPreference::default(),
                     compatible_surface: None,
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .expect("Failed to find an appropriate adapter");
@@ -754,6 +896,7 @@ impl WgpuCanvas {
             height,
             present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1261,6 +1404,11 @@ impl WgpuCanvas {
         }
     }
 
+    /// Queues an input or lifecycle event supplied by an embedding host.
+    pub fn push_event(&self, event: WindowEvent) {
+        let _ = self.out_events.send(event);
+    }
+
     /// Gets the current surface texture for rendering.
     pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
         let surface = self.surface.as_ref()?;
@@ -1323,7 +1471,7 @@ impl WgpuCanvas {
 
     /// Presents the current frame.
     pub fn present(&self, frame: wgpu::SurfaceTexture) {
-        frame.present();
+        Context::get().queue.present(frame);
     }
 
     /// Reads pixels from the readback texture into the provided buffer.
@@ -1450,7 +1598,9 @@ impl WgpuCanvas {
 
         // Read the data
         let buffer_slice = staging_buffer.slice(..);
-        let data = buffer_slice.get_mapped_range();
+        let data = buffer_slice
+            .get_mapped_range()
+            .expect("screenshot staging buffer mapping became invalid");
 
         // Convert from BGRA/RGBA to RGB and handle row padding
         let rgb_size = width * height * 3;
