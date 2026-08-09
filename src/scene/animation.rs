@@ -380,6 +380,16 @@ impl AnimationPlayer {
         self.clips.len()
     }
 
+    /// Returns the duration of the clip at `index`.
+    pub fn clip_duration(&self, index: usize) -> Option<f32> {
+        self.clips.get(index).map(AnimationClip::duration)
+    }
+
+    /// Returns the active clip index, if one has been selected.
+    pub fn current_clip_index(&self) -> Option<usize> {
+        self.current
+    }
+
     /// The names of all clips, in index order.
     pub fn clip_names(&self) -> impl Iterator<Item = &str> {
         self.clips.iter().map(|c| c.name.as_str())
@@ -411,6 +421,13 @@ impl AnimationPlayer {
         self.playing = false;
     }
 
+    /// Resumes the selected clip without resetting its playback cursor.
+    pub fn resume(&mut self) {
+        if self.current.is_some() {
+            self.playing = true;
+        }
+    }
+
     /// Whether a clip is currently advancing.
     pub fn is_playing(&self) -> bool {
         self.playing
@@ -419,6 +436,11 @@ impl AnimationPlayer {
     /// Sets whether the active clip loops (default `true`).
     pub fn set_looping(&mut self, looping: bool) {
         self.looping = looping;
+    }
+
+    /// Whether the active clip loops at its end.
+    pub fn is_looping(&self) -> bool {
+        self.looping
     }
 
     /// Sets the playback speed multiplier (default `1.0`; negative plays backward).
@@ -474,5 +496,67 @@ impl AnimationPlayer {
             let t = self.time;
             self.clips[i].apply(t);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_status_and_resume_preserve_cursor() {
+        let target = SceneNode3d::empty();
+        let channel = AnimationChannel::translation(
+            target,
+            vec![0.0, 1.0],
+            vec![Vec3::ZERO, Vec3::X],
+            Interpolation::Linear,
+        );
+        let mut player =
+            AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+        assert_eq!(player.clip_duration(0), Some(1.0));
+        assert_eq!(player.current_clip_index(), None);
+        player.play_index(0);
+        player.update(0.25);
+        player.stop();
+        assert_eq!(player.time(), 0.25);
+        player.update(0.25);
+        assert_eq!(player.time(), 0.25);
+        player.resume();
+        player.update(0.25);
+        assert_eq!(player.time(), 0.5);
+        assert!(player.is_looping());
+    }
+
+    #[test]
+    fn playback_clamps_or_wraps_at_clip_boundaries() {
+        let target = SceneNode3d::empty();
+        let channel = AnimationChannel::translation(
+            target,
+            vec![0.0, 1.0],
+            vec![Vec3::ZERO, Vec3::X],
+            Interpolation::Linear,
+        );
+        let mut player =
+            AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+        player.play_index(0);
+        player.seek(0.9);
+        player.update(0.2);
+        assert!((player.time() - 0.1).abs() < 1.0e-5);
+        assert!(player.is_playing());
+
+        player.set_looping(false);
+        player.seek(0.9);
+        player.update(0.2);
+        assert_eq!(player.time(), 1.0);
+        assert!(!player.is_playing());
+
+        player.set_looping(true);
+        player.set_speed(-1.0);
+        player.seek(0.1);
+        player.resume();
+        player.update(0.2);
+        assert!((player.time() - 0.9).abs() < 1.0e-5);
+        assert!(player.is_playing());
     }
 }

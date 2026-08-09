@@ -295,8 +295,25 @@ fn apply_material(
     object.set_color(Color::new(bc[0], bc[1], bc[2], bc[3]));
     object.set_metallic(pbr.metallic_factor());
     object.set_roughness(pbr.roughness_factor());
+    let extensions = material_extension_factors(material);
     let ef = material.emissive_factor();
-    object.set_emissive(Color::new(ef[0], ef[1], ef[2], 1.0));
+    object.set_emissive(Color::new(
+        ef[0] * extensions.emissive_strength,
+        ef[1] * extensions.emissive_strength,
+        ef[2] * extensions.emissive_strength,
+        1.0,
+    ));
+    if let Some(ior) = extensions.ior {
+        object.set_ior(ior);
+    }
+    if let Some(transmission) = extensions.transmission {
+        object.set_transmission(transmission);
+    }
+    if extensions.has_transmission_texture {
+        log::warn!(
+            "gltf: KHR_materials_transmission texture is not supported; using transmissionFactor only"
+        );
+    }
 
     // Color/emissive textures are sRGB; data textures (normal/MR/AO) are linear.
     if let Some(info) = pbr.base_color_texture() {
@@ -343,6 +360,28 @@ fn apply_material(
             info.texture().source().index(),
             true,
         ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MaterialExtensionFactors {
+    emissive_strength: f32,
+    ior: Option<f32>,
+    transmission: Option<f32>,
+    has_transmission_texture: bool,
+}
+
+fn material_extension_factors(material: &gltf::Material<'_>) -> MaterialExtensionFactors {
+    let transmission = material.transmission();
+    MaterialExtensionFactors {
+        emissive_strength: material.emissive_strength().unwrap_or(1.0),
+        ior: material.ior(),
+        transmission: transmission
+            .as_ref()
+            .map(|value| value.transmission_factor()),
+        has_transmission_texture: transmission
+            .and_then(|value| value.transmission_texture())
+            .is_some(),
     }
 }
 
@@ -480,5 +519,77 @@ fn image_data_to_dynamic(data: &gltf::image::Data) -> DynamicImage {
             image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
                 .expect("gltf: bad RGBA32F image"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{material_extension_factors, MaterialExtensionFactors};
+
+    fn first_material(json: &str) -> gltf::Gltf {
+        gltf::Gltf::from_slice(json.as_bytes()).expect("test glTF should parse")
+    }
+
+    #[test]
+    fn material_extension_factors_default_to_core_gltf_values() {
+        let gltf = first_material(
+            r#"{
+                "asset": { "version": "2.0" },
+                "materials": [{}]
+            }"#,
+        );
+        let material = gltf.materials().next().unwrap();
+
+        assert_eq!(
+            material_extension_factors(&material),
+            MaterialExtensionFactors {
+                emissive_strength: 1.0,
+                ior: None,
+                transmission: None,
+                has_transmission_texture: false,
+            }
+        );
+    }
+
+    #[test]
+    fn material_extension_factors_read_lightweight_khr_materials() {
+        let gltf = first_material(
+            r#"{
+                "asset": { "version": "2.0" },
+                "extensionsUsed": [
+                    "KHR_materials_emissive_strength",
+                    "KHR_materials_ior",
+                    "KHR_materials_transmission"
+                ],
+                "extensionsRequired": [
+                    "KHR_materials_emissive_strength",
+                    "KHR_materials_ior",
+                    "KHR_materials_transmission"
+                ],
+                "images": [{ "uri": "unused.png" }],
+                "textures": [{ "source": 0 }],
+                "materials": [{
+                    "extensions": {
+                        "KHR_materials_emissive_strength": { "emissiveStrength": 3.0 },
+                        "KHR_materials_ior": { "ior": 1.33 },
+                        "KHR_materials_transmission": {
+                            "transmissionFactor": 0.75,
+                            "transmissionTexture": { "index": 0 }
+                        }
+                    }
+                }]
+            }"#,
+        );
+        let material = gltf.materials().next().unwrap();
+
+        assert_eq!(
+            material_extension_factors(&material),
+            MaterialExtensionFactors {
+                emissive_strength: 3.0,
+                ior: Some(1.33),
+                transmission: Some(0.75),
+                has_transmission_texture: true,
+            }
+        );
     }
 }
