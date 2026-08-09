@@ -43,6 +43,27 @@ impl Window {
             .draw_line(a, b, color, width, perspective);
     }
 
+    /// Draws a 3D line with an explicit clip-space depth bias.
+    #[inline]
+    pub fn draw_line_with_depth_bias(
+        &mut self,
+        a: Vec3,
+        b: Vec3,
+        color: Color,
+        width: f32,
+        perspective: bool,
+        depth_bias: f32,
+    ) {
+        self.polyline_renderer.draw_line_with_depth_bias(
+            a,
+            b,
+            color,
+            width,
+            perspective,
+            depth_bias,
+        );
+    }
+
     /// Draws a 2D line for the current frame.
     ///
     /// The line is only drawn during the next frame. To keep a line visible,

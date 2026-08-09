@@ -47,6 +47,9 @@ pub struct GltfModel {
     pub root: SceneNode3d,
     /// Player owning every animation clip found in the file.
     pub player: AnimationPlayer,
+    /// Parent/child handles for nodes referenced by at least one glTF skin.
+    /// These are debug-only skeleton edges; mesh attachment nodes are excluded.
+    pub skeleton_edges: Vec<(SceneNode3d, SceneNode3d)>,
 }
 
 impl SceneNodeData3d {
@@ -2752,6 +2755,15 @@ impl SceneNode3d {
         let mut data = self.data.borrow_mut();
         data.update();
         data.world_transform
+    }
+
+    /// Full world matrix composed from every ancestor's local TRS.
+    ///
+    /// Unlike [`Self::world_pose`], this includes ancestor scale in descendant
+    /// translations and therefore matches the matrix used by skeletal skinning.
+    #[inline]
+    pub fn world_matrix(&self) -> Mat4 {
+        node_global_matrix(&self.data)
     }
 
     /// This node world scale.

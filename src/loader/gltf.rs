@@ -21,7 +21,7 @@ use crate::scene::{
 use glamx::{Mat4, Pose3, Quat, Vec2, Vec3};
 use image::DynamicImage;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -146,12 +146,28 @@ fn build_model(
     }
 
     // Link the node hierarchy.
+    let mut parent_by_node = vec![None; node_map.len()];
     for node in doc.nodes() {
         let mut parent = node_map[node.index()].clone();
         for child in node.children() {
+            parent_by_node[child.index()] = Some(node.index());
             parent.add_child(node_map[child.index()].clone());
         }
     }
+
+    let joint_nodes: HashSet<usize> = doc
+        .skins()
+        .flat_map(|skin| skin.joints().map(|joint| joint.index()))
+        .collect();
+    let skeleton_edges = joint_edges(&parent_by_node, &joint_nodes)
+        .into_iter()
+        .map(|(parent_index, child_index)| {
+            (
+                node_map[parent_index].clone(),
+                node_map[child_index].clone(),
+            )
+        })
+        .collect();
 
     // Assemble the model root from the default (or first) scene's root nodes.
     let mut root = SceneNode3d::empty();
@@ -171,7 +187,23 @@ fn build_model(
     Ok(GltfModel {
         root,
         player: AnimationPlayer::new(clips),
+        skeleton_edges,
     })
+}
+
+fn joint_edges(
+    parent_by_node: &[Option<usize>],
+    joint_nodes: &HashSet<usize>,
+) -> Vec<(usize, usize)> {
+    parent_by_node
+        .iter()
+        .enumerate()
+        .filter_map(|(child_index, parent_index)| {
+            let parent_index = (*parent_index)?;
+            (joint_nodes.contains(&parent_index) && joint_nodes.contains(&child_index))
+                .then_some((parent_index, child_index))
+        })
+        .collect()
 }
 
 /// Reads one triangle primitive into a [`GpuMesh3d`], including optional skinning
@@ -524,7 +556,8 @@ fn image_data_to_dynamic(data: &gltf::image::Data) -> DynamicImage {
 
 #[cfg(test)]
 mod tests {
-    use super::{material_extension_factors, MaterialExtensionFactors};
+    use super::{joint_edges, material_extension_factors, MaterialExtensionFactors};
+    use std::collections::HashSet;
 
     fn first_material(json: &str) -> gltf::Gltf {
         gltf::Gltf::from_slice(json.as_bytes()).expect("test glTF should parse")
@@ -591,5 +624,12 @@ mod tests {
                 has_transmission_texture: true,
             }
         );
+    }
+
+    #[test]
+    fn skeleton_edges_exclude_non_joint_parents_and_mesh_children() {
+        let parents = vec![None, Some(0), Some(1), Some(1), Some(2)];
+        let joints = HashSet::from([1, 2, 4]);
+        assert_eq!(joint_edges(&parents, &joints), vec![(1, 2), (2, 4)]);
     }
 }

@@ -26,6 +26,9 @@ const MAX_BAKED_NODE_SAMPLES: usize = 2_000_000;
 pub struct FbxModel {
     pub root: SceneNode3d,
     pub player: AnimationPlayer,
+    /// Parent/child handles for nodes referenced by an FBX skin. Mesh
+    /// attachment/group nodes are intentionally excluded from this list.
+    pub skeleton_edges: Vec<(SceneNode3d, SceneNode3d)>,
 }
 
 /// Read-only FBX animation metadata for editor Timeline projection.
@@ -158,6 +161,12 @@ fn build_model(scene: &ufbx::Scene) -> Result<FbxModel, String> {
         return Err("FBX contains no supported triangle meshes".to_string());
     }
 
+    let joint_nodes: HashSet<usize> = primitives
+        .iter()
+        .filter_map(|primitive| primitive.skin.as_ref())
+        .flat_map(|skin| skin.joints.iter().copied())
+        .collect();
+
     let mut node_map = Vec::with_capacity(scene.nodes.len());
     for node in scene.nodes.iter() {
         let (translation, rotation, scale) = transform_parts(node.local_transform)?;
@@ -180,6 +189,23 @@ fn build_model(scene: &ufbx::Scene) -> Result<FbxModel, String> {
             root.add_child(node_map[index].clone());
         }
     }
+
+    let mut parent_by_node = vec![None; scene.nodes.len()];
+    for (child_index, node) in scene.nodes.iter().enumerate() {
+        parent_by_node[child_index] = node
+            .parent
+            .as_deref()
+            .and_then(|parent| node_indices.get(&parent.element.element_id).copied());
+    }
+    let skeleton_edges = joint_edges(&parent_by_node, &joint_nodes)
+        .into_iter()
+        .map(|(parent_index, child_index)| {
+            (
+                node_map[parent_index].clone(),
+                node_map[child_index].clone(),
+            )
+        })
+        .collect();
 
     let material = MaterialManager3d::get_global_manager(|manager| manager.get_default());
     let texture = TextureManager::get_global_manager(|manager| manager.get_default());
@@ -227,7 +253,23 @@ fn build_model(scene: &ufbx::Scene) -> Result<FbxModel, String> {
     Ok(FbxModel {
         root,
         player: AnimationPlayer::new(clips),
+        skeleton_edges,
     })
+}
+
+fn joint_edges(
+    parent_by_node: &[Option<usize>],
+    joint_nodes: &HashSet<usize>,
+) -> Vec<(usize, usize)> {
+    parent_by_node
+        .iter()
+        .enumerate()
+        .filter_map(|(child_index, parent_index)| {
+            let parent_index = (*parent_index)?;
+            (joint_nodes.contains(&parent_index) && joint_nodes.contains(&child_index))
+                .then_some((parent_index, child_index))
+        })
+        .collect()
 }
 
 fn extract_primitives(scene: &ufbx::Scene) -> Result<Vec<CpuPrimitive>, String> {
@@ -806,5 +848,12 @@ Connections: { C: "OO",100,0 C: "OO",101,100 }
     #[test]
     fn rejects_non_fbx_memory() {
         assert!(ufbx::load_memory(b"not an fbx", load_options(true)).is_err());
+    }
+
+    #[test]
+    fn skeleton_edges_exclude_non_joint_parents_and_mesh_children() {
+        let parents = vec![None, Some(0), Some(1), Some(1), Some(2)];
+        let joints = HashSet::from([1, 2, 4]);
+        assert_eq!(joint_edges(&parents, &joints), vec![(1, 2), (2, 4)]);
     }
 }
