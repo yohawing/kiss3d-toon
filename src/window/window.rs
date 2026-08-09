@@ -33,6 +33,7 @@ use winit::window::WindowAttributes;
 pub(super) use super::egui_integration::EguiContext;
 #[cfg(feature = "recording")]
 pub(super) use super::recording::RecordingState;
+use super::viewport::{RenderViewport, ViewportCompositor};
 use super::window_cache::WindowCache;
 
 pub(super) static DEFAULT_WIDTH: u32 = 800u32;
@@ -110,6 +111,10 @@ pub struct Window {
     /// Offscreen render target used when the window is hidden, so `snap` and
     /// recording work without a presentable surface. Created on first use.
     pub(super) offscreen_output_target: Option<RenderTarget>,
+    /// Optional physical-pixel sub-viewport for embedded rendering. The full
+    /// scene is rendered offscreen at this size and composited into the surface.
+    pub(super) render_viewport: Option<RenderViewport>,
+    pub(super) viewport_compositor: ViewportCompositor,
     /// Renderer for auxiliary outputs (depth, normals, segmentation). Created
     /// on first use of an AOV-producing method.
     pub(super) aov_renderer: Option<crate::builtin::AovRenderer>,
@@ -1041,6 +1046,8 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            render_viewport: None,
+            viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             hidden: hide,
             shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
@@ -1132,6 +1139,8 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            render_viewport: None,
+            viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             hidden: false,
             shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
@@ -1203,6 +1212,8 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            render_viewport: None,
+            viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             // A headless window has no surface; always render off-screen.
             hidden: true,

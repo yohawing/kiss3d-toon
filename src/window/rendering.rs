@@ -226,10 +226,35 @@ impl Window {
             }
         };
 
-        // Read the size only now: while retrying, a pending resize event may
-        // have been processed and the surface reconfigured.
-        let w = self.width();
-        let h = self.height();
+        // Read the surface size only now: while retrying, a pending resize
+        // event may have been processed and the surface reconfigured.
+        let surface_w = self.width();
+        let surface_h = self.height();
+        let configured_viewport = !offscreen && self.render_viewport.is_some();
+        let render_viewport = if offscreen {
+            None
+        } else {
+            self.render_viewport
+                .and_then(|viewport| viewport.clamp(surface_w, surface_h))
+        };
+
+        // A configured zero-size or fully clipped viewport renders nothing and
+        // clears the surface, preventing pixels from the previous layout from
+        // leaking behind DOM panels.
+        if configured_viewport && render_viewport.is_none() {
+            let frame = frame.expect("visible windows acquire a surface frame");
+            let surface_view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.viewport_compositor.clear(&surface_view);
+            self.canvas.copy_frame_to_readback(&frame);
+            self.canvas.present(frame);
+            return !self.should_close();
+        }
+
+        let (w, h) = render_viewport
+            .map(|viewport| (viewport.width, viewport.height))
+            .unwrap_or((surface_w, surface_h));
 
         camera_2d.handle_event(&self.canvas, &WindowEvent::FramebufferSize(w, h));
         camera.handle_event(&self.canvas, &WindowEvent::FramebufferSize(w, h));
@@ -241,7 +266,8 @@ impl Window {
 
         // `OffscreenBuffers` are never multisampled, so offscreen rendering
         // always uses a single sample (a hidden window is not antialiased).
-        let sample_count = if offscreen {
+        let render_offscreen = offscreen || render_viewport.is_some();
+        let sample_count = if render_offscreen {
             1
         } else {
             self.canvas.sample_count()
@@ -262,7 +288,7 @@ impl Window {
             .resize(w, h, self.canvas.surface_format());
         self.post_process_render_target_b
             .resize(w, h, self.canvas.surface_format());
-        if offscreen {
+        if render_offscreen {
             if self.offscreen_output_target.is_none() {
                 self.offscreen_output_target =
                     Some(self.framebuffer_manager.new_render_target(w, h, true));
@@ -274,19 +300,27 @@ impl Window {
             );
         }
 
-        // The view that receives the final composited image: the surface
-        // texture for a visible window, the offscreen color texture otherwise.
-        let frame_view = match &frame {
-            Some(frame) => frame
+        let surface_view = frame.as_ref().map(|frame| {
+            frame
                 .texture
-                .create_view(&wgpu::TextureViewDescriptor::default()),
-            None => self
-                .offscreen_output_target
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
+
+        // A partial viewport renders every pass into a viewport-sized target,
+        // preserving post effects and screen-space math. The final image is
+        // composited into the full surface below.
+        let frame_view = if render_offscreen {
+            self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
                 .color_view()
                 .expect("offscreen render target is never the screen")
-                .clone(),
+                .clone()
+        } else {
+            surface_view
+                .as_ref()
+                .expect("visible full-surface render has a surface view")
+                .clone()
         };
 
         // The rasterized scene always renders into the HDR film. `color_view` is
@@ -299,7 +333,7 @@ impl Window {
         // The depth attachment must match the scene target's sample count. The
         // canvas depth texture is built MSAA-aware; offscreen rendering is always
         // single-sampled and uses the offscreen target's depth.
-        let depth_view = if offscreen {
+        let depth_view = if render_offscreen {
             self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
@@ -1262,6 +1296,16 @@ impl Window {
                 w,
                 h,
                 self.canvas.scale_factor() as f32,
+            );
+        }
+
+        if let Some(viewport) = render_viewport {
+            self.viewport_compositor.composite(
+                &frame_view,
+                surface_view
+                    .as_ref()
+                    .expect("partial viewport rendering has a surface view"),
+                viewport,
             );
         }
 

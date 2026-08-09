@@ -13,6 +13,7 @@ mod offscreen;
 mod recording;
 mod rendering;
 mod screenshot;
+mod viewport;
 mod wgpu_canvas;
 mod window;
 mod window_cache;
@@ -23,6 +24,7 @@ pub use inspector::{Inspector, InspectorTab};
 pub use offscreen::OffscreenSurface;
 #[cfg(feature = "recording")]
 pub use recording::RecordingConfig;
+pub use viewport::RenderViewport;
 pub use wgpu_canvas::WgpuCanvas;
 pub use window::Window;
 pub(crate) use window_cache::WINDOW_CACHE;
