@@ -26,5 +26,6 @@ pub use offscreen::OffscreenSurface;
 pub use recording::RecordingConfig;
 pub use viewport::RenderViewport;
 pub use wgpu_canvas::WgpuCanvas;
-pub use window::Window;
+pub(crate) use window::SurfaceAcquire;
+pub use window::{RenderFrameStatus, SurfaceSkipReason, SurfaceUnavailableReason, Window};
 pub(crate) use window_cache::WINDOW_CACHE;

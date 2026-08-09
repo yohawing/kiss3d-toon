@@ -46,6 +46,50 @@ pub(super) static DEFAULT_HEIGHT: u32 = 600u32;
 /// and fill (the atlas is `resolution² × MAX_SHADOW_VIEWS`).
 pub(super) static DEFAULT_SHADOW_RESOLUTION: u32 = 2048u32;
 
+/// Why a surface frame was skipped without making the renderer unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceSkipReason {
+    Timeout,
+    Occluded,
+    OutdatedAfterReconfigure,
+    ZeroSizedSurface,
+}
+
+/// Why a visible surface can no longer be used by the raster renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceUnavailableReason {
+    Lost,
+    Validation,
+    MissingSurface,
+}
+
+/// Outcome of one raster 3D frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderFrameStatus {
+    Presented { suboptimal: bool },
+    Skipped(SurfaceSkipReason),
+    SurfaceUnavailable(SurfaceUnavailableReason),
+    Closed,
+}
+
+impl RenderFrameStatus {
+    /// Preserve the historical bool API: only a closed window stops the loop.
+    pub(crate) fn should_continue(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
+/// Internal surface acquisition result. The texture is kept private to the
+/// window module boundary; callers only receive the public frame status.
+pub(crate) enum SurfaceAcquire {
+    Ready {
+        texture: wgpu::SurfaceTexture,
+        suboptimal: bool,
+    },
+    Skip(SurfaceSkipReason),
+    Unavailable(SurfaceUnavailableReason),
+}
+
 /// Structure representing a window and a 3D scene.
 ///
 /// This is the main interface with the 3d engine.

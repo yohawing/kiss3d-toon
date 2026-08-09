@@ -16,7 +16,7 @@ use crate::resource::{
 };
 use crate::scene::{SceneNode2d, SceneNode3d};
 
-use super::Window;
+use super::{RenderFrameStatus, SurfaceAcquire, Window};
 
 /// Grace period during which the first frame keeps retrying surface acquisition
 /// before giving up. A freshly created window — particularly on macOS — may need
@@ -28,7 +28,27 @@ const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[cfg(not(target_arch = "wasm32"))]
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+fn should_retry_surface_startup(outcome: &SurfaceAcquire) -> bool {
+    !matches!(outcome, SurfaceAcquire::Unavailable(_))
+}
+
 impl Window {
+    /// Renders one raster 3D frame and preserves the surface outcome.
+    ///
+    /// This status API is one-shot for surface acquisition and never enters the
+    /// optional ray-tracing switcher path. A transient acquisition result is
+    /// returned to the caller for that frame.
+    pub async fn render_3d_status(
+        &mut self,
+        scene: &mut SceneNode3d,
+        camera: &mut impl Camera3d,
+    ) -> RenderFrameStatus {
+        let mut default_cam2 = FixedView2d::default();
+        self.handle_events(camera, &mut default_cam2);
+        self.render_single_frame_status(Some(scene), None, camera, &mut default_cam2, None, &mut [])
+            .await
+    }
+
     /// Renders one frame of a 3D scene.
     ///
     /// This is the main rendering function that should be called in your render loop.
@@ -60,9 +80,19 @@ impl Window {
     /// # Platform-specific
     /// - **Native**: Returns immediately after rendering one frame
     /// - **WASM**: Yields to the browser's event loop and returns when the next frame is ready
+    ///
+    /// The optional `rt_switcher` feature preserves its historical render/raytrace
+    /// dispatch. Without it, this bool API projects the raster status result.
     pub async fn render_3d(&mut self, scene: &mut SceneNode3d, camera: &mut impl Camera3d) -> bool {
-        self.render(Some(scene), None, Some(camera), None, None, None)
-            .await
+        #[cfg(feature = "rt_switcher")]
+        {
+            self.render(Some(scene), None, Some(camera), None, None, None)
+                .await
+        }
+        #[cfg(not(feature = "rt_switcher"))]
+        {
+            self.render_3d_status(scene, camera).await.should_continue()
+        }
     }
 
     pub async fn render_2d(&mut self, scene: &mut SceneNode2d, camera: &mut impl Camera2d) -> bool {
@@ -188,13 +218,34 @@ impl Window {
 
     async fn render_single_frame(
         &mut self,
+        scene: Option<&mut SceneNode3d>,
+        scene_2d: Option<&mut SceneNode2d>,
+        camera: &mut dyn Camera3d,
+        camera_2d: &mut dyn Camera2d,
+        renderer: Option<&mut dyn Renderer3d>,
+        post_processing: &mut [&mut dyn PostProcessingEffect],
+    ) -> bool {
+        self.render_single_frame_status(
+            scene,
+            scene_2d,
+            camera,
+            camera_2d,
+            renderer,
+            post_processing,
+        )
+        .await
+        .should_continue()
+    }
+
+    async fn render_single_frame_status(
+        &mut self,
         mut scene: Option<&mut SceneNode3d>,
         mut scene_2d: Option<&mut SceneNode2d>,
         camera: &mut dyn Camera3d,
         camera_2d: &mut dyn Camera2d,
         mut renderer: Option<&mut dyn Renderer3d>,
         post_processing: &mut [&mut dyn PostProcessingEffect],
-    ) -> bool {
+    ) -> RenderFrameStatus {
         // Frame timing: CPU wall-clock for the whole frame (and submit/present
         // below) plus per-pass GPU timestamps recorded into the GPU timer. The
         // frame-to-frame wall-clock period (true FPS) is the delta between
@@ -217,12 +268,28 @@ impl Window {
         // Acquire the surface texture for visible windows. A just-created
         // window may not be presentable yet, so `acquire_next_frame` retries
         // until it is.
-        let frame = if offscreen {
-            None
+        let (frame, suboptimal) = if offscreen {
+            (None, false)
         } else {
-            match self.acquire_next_frame() {
-                Some(frame) => Some(frame),
-                None => return !self.should_close(),
+            match self.acquire_next_frame_status() {
+                SurfaceAcquire::Ready {
+                    texture,
+                    suboptimal,
+                } => (Some(texture), suboptimal),
+                SurfaceAcquire::Skip(reason) => {
+                    return if self.should_close() {
+                        RenderFrameStatus::Closed
+                    } else {
+                        RenderFrameStatus::Skipped(reason)
+                    }
+                }
+                SurfaceAcquire::Unavailable(reason) => {
+                    return if self.should_close() {
+                        RenderFrameStatus::Closed
+                    } else {
+                        RenderFrameStatus::SurfaceUnavailable(reason)
+                    }
+                }
             }
         };
 
@@ -249,7 +316,11 @@ impl Window {
             self.viewport_compositor.clear(&surface_view);
             self.canvas.copy_frame_to_readback(&frame);
             self.canvas.present(frame);
-            return !self.should_close();
+            return if self.should_close() {
+                RenderFrameStatus::Closed
+            } else {
+                RenderFrameStatus::Presented { suboptimal }
+            };
         }
 
         let (w, h) = render_viewport
@@ -1366,7 +1437,11 @@ impl Window {
             }
         }
 
-        !self.should_close()
+        if self.should_close() {
+            RenderFrameStatus::Closed
+        } else {
+            RenderFrameStatus::Presented { suboptimal }
+        }
     }
 
     /// Renders one path-traced frame.
@@ -1611,14 +1686,14 @@ impl Window {
     /// acquired, a later failure (e.g. a minimized window) skips the frame
     /// immediately instead of stalling.
     fn acquire_next_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
-        if let Some(frame) = self.canvas.get_current_texture() {
-            self.first_frame = false;
-            return Some(frame);
+        let initial = self.acquire_next_frame_status();
+        if let SurfaceAcquire::Ready { texture, .. } = initial {
+            return Some(texture);
         }
 
-        // The window has rendered before: treat this as a transient failure
-        // and skip the frame without stalling.
-        if !self.first_frame {
+        // Preserve the historical startup grace period for private non-status
+        // callers, but never retry an unavailable surface.
+        if !self.first_frame || !should_retry_surface_startup(&initial) {
             return None;
         }
 
@@ -1632,9 +1707,13 @@ impl Window {
                 std::thread::sleep(SURFACE_RETRY_INTERVAL);
                 self.canvas.poll_events();
 
-                if let Some(frame) = self.canvas.get_current_texture() {
+                let outcome = self.canvas.get_current_texture_status();
+                if let SurfaceAcquire::Ready { texture, .. } = outcome {
                     self.first_frame = false;
-                    return Some(frame);
+                    return Some(texture);
+                }
+                if !should_retry_surface_startup(&outcome) {
+                    return None;
                 }
 
                 if std::time::Instant::now() >= deadline {
@@ -1646,6 +1725,15 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// Performs one classified surface acquisition without startup waiting.
+    fn acquire_next_frame_status(&mut self) -> SurfaceAcquire {
+        let outcome = self.canvas.get_current_texture_status();
+        if matches!(outcome, SurfaceAcquire::Ready { .. }) {
+            self.first_frame = false;
+        }
+        outcome
     }
 
     fn render_scene(
@@ -2007,5 +2095,30 @@ impl Window {
             .color_view()
             .expect("offscreen render target is never the screen")
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::{SurfaceSkipReason, SurfaceUnavailableReason};
+
+    #[test]
+    fn startup_surface_policy_retries_skips_but_never_unavailable() {
+        assert!(should_retry_surface_startup(&SurfaceAcquire::Skip(
+            SurfaceSkipReason::Timeout,
+        )));
+        assert!(should_retry_surface_startup(&SurfaceAcquire::Skip(
+            SurfaceSkipReason::ZeroSizedSurface,
+        )));
+        assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
+            SurfaceUnavailableReason::MissingSurface
+        )));
+        assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
+            SurfaceUnavailableReason::Lost
+        )));
+        assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
+            SurfaceUnavailableReason::Validation
+        )));
     }
 }

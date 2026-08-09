@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 
 use crate::event::{Action, Key, MouseButton, WindowEvent};
-use crate::window::WgpuCanvas;
+use crate::window::{SurfaceAcquire, WgpuCanvas};
 use image::{GenericImage, Pixel};
 use winit::window::WindowAttributes;
 
@@ -137,6 +137,11 @@ impl Canvas {
     /// Gets the current surface texture for rendering.
     pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
         self.canvas.get_current_texture()
+    }
+
+    /// Gets the current surface texture and preserves its wgpu acquisition outcome.
+    pub(crate) fn get_current_texture_status(&self) -> SurfaceAcquire {
+        self.canvas.get_current_texture_status()
     }
 
     /// Presents the current frame.
