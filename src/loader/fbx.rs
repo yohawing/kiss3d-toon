@@ -9,7 +9,7 @@ use crate::color::Color;
 use crate::resource::{GpuMesh3d, MaterialManager3d, SkinVertexData, TextureManager};
 use crate::scene::{
     AnimationChannel, AnimationClip, AnimationPlayer, Interpolation as SceneInterpolation,
-    Object3d, SceneNode3d, Skin3d,
+    Object3d, SceneNode3d, SkeletonNode3d, Skin3d,
 };
 use glamx::{Mat3, Mat4, Pose3, Quat, Vec2, Vec3};
 use std::cell::RefCell;
@@ -29,6 +29,8 @@ pub struct FbxModel {
     /// Parent/child handles for nodes referenced by an FBX skin. Mesh
     /// attachment/group nodes are intentionally excluded from this list.
     pub skeleton_edges: Vec<(SceneNode3d, SceneNode3d)>,
+    /// Named joint nodes and their authored parent relationships.
+    pub skeleton_nodes: Vec<SkeletonNode3d>,
 }
 
 /// Read-only FBX animation metadata for editor Timeline projection.
@@ -206,6 +208,24 @@ fn build_model(scene: &ufbx::Scene) -> Result<FbxModel, String> {
             )
         })
         .collect();
+    let skeleton_nodes = scene
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            if !joint_nodes.contains(&index) {
+                return None;
+            }
+            let parent_index =
+                parent_by_node[index].filter(|parent_index| joint_nodes.contains(parent_index));
+            Some(SkeletonNode3d {
+                index,
+                parent_index,
+                name: node_label(node, index),
+                node: node_map[index].clone(),
+            })
+        })
+        .collect();
 
     let material = MaterialManager3d::get_global_manager(|manager| manager.get_default());
     let texture = TextureManager::get_global_manager(|manager| manager.get_default());
@@ -254,6 +274,7 @@ fn build_model(scene: &ufbx::Scene) -> Result<FbxModel, String> {
         root,
         player: AnimationPlayer::new(clips),
         skeleton_edges,
+        skeleton_nodes,
     })
 }
 

@@ -58,9 +58,15 @@ impl Skin3d {
     /// (which must have equal length). The palette starts at identity.
     pub(crate) fn new(
         joints: Vec<Weak<RefCell<SceneNodeData3d>>>,
-        inverse_bind: Vec<Mat4>,
+        mut inverse_bind: Vec<Mat4>,
     ) -> Self {
         let n = joints.len();
+        // Keep the palette and bind arrays index-aligned even for imperfect
+        // exporters. glTF requires at least one matrix per joint, while some
+        // FBX conversions omit a cluster matrix; an identity fallback keeps
+        // that joint attached instead of silently leaving a stale palette slot.
+        inverse_bind.resize(n, Mat4::IDENTITY);
+        inverse_bind.truncate(n);
         Skin3d {
             joints,
             inverse_bind,
@@ -68,6 +74,15 @@ impl Skin3d {
             palette_buffer: None,
             palette_capacity: 0,
         }
+    }
+
+    /// Converts an authored inverse-bind matrix and the current joint world
+    /// transform into the matrix consumed by both the raster and CPU skin paths.
+    /// Keeping this order in one helper prevents a renderer path from applying
+    /// the bind transform in the opposite space.
+    #[inline]
+    pub(crate) fn joint_matrix(joint_world: Mat4, inverse_bind: Mat4) -> Mat4 {
+        joint_world * inverse_bind
     }
 
     /// The number of joints influencing this skin.

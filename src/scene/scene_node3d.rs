@@ -7,7 +7,7 @@ use crate::resource::vertex_index::VertexIndex;
 use crate::resource::{
     GpuMesh3d, Material3d, MaterialManager3d, MeshManager3d, RenderContext, Texture, TextureManager,
 };
-use crate::scene::{AlphaMode, AnimationPlayer, Bsdf, InstanceData3d, Object3d};
+use crate::scene::{AlphaMode, AnimationPlayer, Bsdf, InstanceData3d, Object3d, Skin3d};
 use glamx::{Mat3, Mat4, Pose3, Quat, Vec2, Vec3};
 use std::cell::{Ref, RefCell, RefMut};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,20 @@ pub struct SceneNode3d {
     data: Rc<RefCell<SceneNodeData3d>>,
 }
 
+/// A named joint from a loaded skinned asset.
+///
+/// `node` is the live scene-graph handle used by the renderer. `index` and
+/// `parent_index` refer to the source asset's node table so an editor can
+/// reconstruct the authored skeleton hierarchy without exposing loader-specific
+/// document types across the renderer boundary.
+#[derive(Clone)]
+pub struct SkeletonNode3d {
+    pub index: usize,
+    pub parent_index: Option<usize>,
+    pub name: String,
+    pub node: SceneNode3d,
+}
+
 /// A loaded glTF / GLB model: the scene subtree plus its animations.
 ///
 /// Produced by [`SceneNode3d::add_gltf`]. The `root` has already been added to
@@ -50,6 +64,8 @@ pub struct GltfModel {
     /// Parent/child handles for nodes referenced by at least one glTF skin.
     /// These are debug-only skeleton edges; mesh attachment nodes are excluded.
     pub skeleton_edges: Vec<(SceneNode3d, SceneNode3d)>,
+    /// Named joint nodes and their authored parent relationships.
+    pub skeleton_nodes: Vec<SkeletonNode3d>,
 }
 
 impl SceneNodeData3d {
@@ -1406,7 +1422,7 @@ impl SceneNode3d {
                         .iter_mut()
                         .zip(joint_world.iter().zip(skin.inverse_bind.iter()))
                     {
-                        *slot = *jw * *ibm;
+                        *slot = Skin3d::joint_matrix(*jw, *ibm);
                     }
                     // Upload once here so the color, prepass, and shadow passes all
                     // read the same fresh palette buffer this frame.

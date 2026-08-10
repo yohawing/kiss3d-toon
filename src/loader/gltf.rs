@@ -16,7 +16,7 @@ use crate::resource::{
 };
 use crate::scene::{
     AnimationChannel, AnimationClip, AnimationPlayer, GltfModel, Interpolation, Object3d,
-    SceneNode3d, Skin3d,
+    SceneNode3d, SkeletonNode3d, Skin3d,
 };
 use glamx::{Mat4, Pose3, Quat, Vec2, Vec3};
 use image::DynamicImage;
@@ -168,6 +168,28 @@ fn build_model(
             )
         })
         .collect();
+    let skeleton_nodes = doc
+        .nodes()
+        .filter_map(|node| {
+            let index = node.index();
+            if !joint_nodes.contains(&index) {
+                return None;
+            }
+            let parent_index =
+                parent_by_node[index].filter(|parent_index| joint_nodes.contains(parent_index));
+            let name = node
+                .name()
+                .filter(|name| !name.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Joint {}", index + 1));
+            Some(SkeletonNode3d {
+                index,
+                parent_index,
+                name,
+                node: node_map[index].clone(),
+            })
+        })
+        .collect();
 
     // Assemble the model root from the default (or first) scene's root nodes.
     let mut root = SceneNode3d::empty();
@@ -188,6 +210,7 @@ fn build_model(
         root,
         player: AnimationPlayer::new(clips),
         skeleton_edges,
+        skeleton_nodes,
     })
 }
 
