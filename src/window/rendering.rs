@@ -1745,6 +1745,12 @@ impl Window {
         render_pass: &mut wgpu::RenderPass<'_>,
         context: &RenderContext,
     ) {
+        // Render solid editor/debug overlay triangles before lines and scene
+        // surfaces. Their explicit depth bias lets later scene geometry retain
+        // the same always-visible contract as the existing polyline overlays.
+        self.triangle_renderer
+            .render(pass, camera, render_pass, context);
+
         // Render points
         self.point_renderer
             .render(pass, camera, render_pass, context);

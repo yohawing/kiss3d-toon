@@ -20,6 +20,7 @@ pub use self::ssao::{Ssao, SsaoSettings};
 pub use self::ssr::{Ssr, SsrMaterial, SsrSettings};
 pub use self::timings::RenderTimings;
 pub use self::transmission::{Transmission, TransmissionBlurQuality, TransmissionSettings};
+pub use self::triangle_renderer3d::TriangleRenderer3d;
 
 mod dof;
 #[cfg(feature = "egui")]
@@ -38,3 +39,4 @@ mod ssao;
 mod ssr;
 pub mod timings;
 mod transmission;
+pub mod triangle_renderer3d;

@@ -11,6 +11,18 @@ use crate::text::Font;
 use super::Window;
 
 impl Window {
+    /// Draws one solid, frame-local 3D triangle with an explicit clip-space depth bias.
+    #[inline]
+    pub fn draw_triangle_with_depth_bias(
+        &mut self,
+        points: [Vec3; 3],
+        color: Color,
+        depth_bias: f32,
+    ) {
+        self.triangle_renderer
+            .draw_triangle(points, color, depth_bias);
+    }
+
     /// Draws a 3D line for the current frame.
     ///
     /// The line is only drawn during the next frame. To keep a line visible,

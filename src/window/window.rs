@@ -15,7 +15,7 @@ use crate::post_processing::{HdrPipeline, HdrSettings, Tonemap};
 use crate::renderer::timings::GpuTimer;
 use crate::renderer::{
     PointRenderer2d, PointRenderer3d, PolylineRenderer2d, PolylineRenderer3d, RayTracer,
-    RenderTimings,
+    RenderTimings, TriangleRenderer3d,
 };
 use crate::resource::{
     FramebufferManager, MaterialManager2d, MeshManager2d, RenderTarget, Texture, TextureManager,
@@ -104,6 +104,7 @@ pub struct Window {
     pub(super) point_renderer_2d: PointRenderer2d,
     pub(super) point_renderer: PointRenderer3d,
     pub(super) polyline_renderer: PolylineRenderer3d,
+    pub(super) triangle_renderer: TriangleRenderer3d,
     pub(super) text_renderer: TextRenderer,
     pub(super) framebuffer_manager: FramebufferManager,
     /// Real-time shadow mapper for the rasterization pipeline.
@@ -1067,6 +1068,7 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            triangle_renderer: TriangleRenderer3d::new(),
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
@@ -1160,6 +1162,7 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            triangle_renderer: TriangleRenderer3d::new(),
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
@@ -1232,6 +1235,7 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            triangle_renderer: TriangleRenderer3d::new(),
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
