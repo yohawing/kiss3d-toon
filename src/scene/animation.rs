@@ -136,7 +136,10 @@ impl AnimationChannel {
         if n == 0 {
             return None;
         }
-        if t <= self.times[0] || n == 1 {
+        if !t.is_finite() {
+            return Some((0, 0, 0.0));
+        }
+        if t < self.times[0] || n == 1 {
             return Some((0, 0, 0.0));
         }
         if t >= self.times[n - 1] {
@@ -184,7 +187,14 @@ impl AnimationChannel {
                 } else {
                     v[i0].slerp(v[i1], u)
                 };
-                self.target.set_rotation(value.normalize());
+                let fallback = if cubic {
+                    let key = if u <= 0.5 { i0 } else { i1 };
+                    v[3 * key + 1]
+                } else {
+                    v[i0]
+                };
+                self.target
+                    .set_rotation(normalize_quat_or_fallback(value, fallback));
             }
             ChannelOutput::MorphWeights {
                 values,
@@ -273,7 +283,20 @@ fn sample_quat_cubic(v: &[Quat], i0: usize, i1: usize, u: f32, dt: f32) -> Quat 
         quat_add(quat_scale(p0, h00), quat_scale(m0, h10)),
         quat_add(quat_scale(p1, h01), quat_scale(m1, h11)),
     );
-    q.normalize()
+    let fallback = if u <= 0.5 { p0 } else { p1 };
+    normalize_quat_or_fallback(q, fallback)
+}
+
+fn normalize_quat_or_fallback(value: Quat, fallback: Quat) -> Quat {
+    let value_length = value.length_squared();
+    if value.is_finite() && value_length.is_finite() && value_length > f32::EPSILON {
+        return value.normalize();
+    }
+    let fallback_length = fallback.length_squared();
+    if fallback.is_finite() && fallback_length.is_finite() && fallback_length > f32::EPSILON {
+        return fallback.normalize();
+    }
+    Quat::IDENTITY
 }
 
 /// Cubic Hermite blend of two endpoints and tangents.
@@ -445,7 +468,7 @@ impl AnimationPlayer {
 
     /// Sets the playback speed multiplier (default `1.0`; negative plays backward).
     pub fn set_speed(&mut self, speed: f32) {
-        self.speed = speed;
+        self.speed = if speed.is_finite() { speed } else { 1.0 };
     }
 
     /// The current playback time in seconds within the active clip.
@@ -455,7 +478,7 @@ impl AnimationPlayer {
 
     /// Seeks the active clip to `time` seconds and re-applies the pose.
     pub fn seek(&mut self, time: f32) {
-        self.time = time;
+        self.time = if time.is_finite() { time } else { 0.0 };
         self.apply_current();
     }
 
@@ -463,31 +486,35 @@ impl AnimationPlayer {
     /// the target nodes. Call once per frame before rendering. No-op when stopped
     /// or when no clip is active.
     pub fn update(&mut self, dt: f32) {
-        if !self.playing {
+        if !self.playing || !dt.is_finite() {
             return;
         }
         let Some(i) = self.current else {
             return;
         };
         let duration = self.clips[i].duration;
-        self.time += dt * self.speed;
+        // Keep the cursor finite even when two individually valid f32 inputs
+        // overflow their product. f64 has ample range for any f32 pair and
+        // preserves the usual wrapping/clamping semantics below.
+        let mut next_time = f64::from(self.time) + f64::from(dt) * f64::from(self.speed);
 
         if duration > 0.0 {
             if self.looping {
                 // rem_euclid keeps the cursor in `[0, duration)` for both
                 // forward and backward playback.
-                self.time = self.time.rem_euclid(duration);
-            } else if self.time >= duration {
-                self.time = duration;
+                next_time = next_time.rem_euclid(f64::from(duration));
+            } else if next_time >= f64::from(duration) {
+                next_time = f64::from(duration);
                 self.playing = false;
-            } else if self.time < 0.0 {
-                self.time = 0.0;
+            } else if next_time < 0.0 {
+                next_time = 0.0;
                 self.playing = false;
             }
         } else {
-            self.time = 0.0;
+            next_time = 0.0;
         }
 
+        self.time = next_time as f32;
         self.apply_current();
     }
 
@@ -558,5 +585,152 @@ mod tests {
         player.update(0.2);
         assert!((player.time() - 0.9).abs() < 1.0e-5);
         assert!(player.is_playing());
+    }
+
+    #[test]
+    fn duplicate_key_boundary_uses_last_duplicate_consistently() {
+        let target = SceneNode3d::empty();
+        let channel = AnimationChannel::translation(
+            target.clone(),
+            vec![0.0, 0.0, 1.0],
+            vec![Vec3::ZERO, Vec3::Y, Vec3::X],
+            Interpolation::Linear,
+        );
+        let mut player =
+            AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+        player.play_index(0);
+        player.seek(0.0);
+
+        assert_eq!(target.position(), Vec3::Y);
+    }
+
+    #[test]
+    fn morph_sampling_keeps_target_slots_across_interpolations() {
+        let linear_keys = vec![0.25, 0.5, 0.75, 1.0];
+        let step = sample_weights(&linear_keys, 2, Interpolation::Step, 0, 1, 0.5, 1.0);
+        assert_eq!(step, vec![0.25, 0.5]);
+
+        let linear = sample_weights(&linear_keys, 2, Interpolation::Linear, 0, 1, 0.5, 1.0);
+        assert_eq!(linear.len(), 2);
+        assert!((linear[0] - 0.5).abs() < f32::EPSILON);
+        assert!((linear[1] - 0.75).abs() < f32::EPSILON);
+
+        let vectors = vec![
+            Vec3::ZERO,
+            Vec3::new(0.25, 0.5, 0.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(0.75, 1.0, 0.0),
+            Vec3::ZERO,
+        ];
+        let vector = sample_vec3(&vectors, Interpolation::CubicSpline, 0, 1, 0.5, 1.0);
+        assert!((vector.x - 0.5).abs() < f32::EPSILON);
+        assert!((vector.y - 0.75).abs() < f32::EPSILON);
+
+        let morph = vec![0.0, 0.0, 0.25, 0.5, 0.0, 0.0, 0.0, 0.0, 0.75, 1.0, 0.0, 0.0];
+        let weights = sample_weights(&morph, 2, Interpolation::CubicSpline, 0, 1, 0.5, 1.0);
+        assert!((weights[0] - 0.5).abs() < f32::EPSILON);
+        assert!((weights[1] - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn non_finite_runtime_inputs_fail_closed_without_panicking() {
+        let target = SceneNode3d::empty();
+        let channel = AnimationChannel::translation(
+            target,
+            vec![0.0, 1.0],
+            vec![Vec3::ZERO, Vec3::X],
+            Interpolation::Linear,
+        );
+        let mut player =
+            AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+        player.play_index(0);
+
+        player.seek(f32::NAN);
+        assert_eq!(player.time(), 0.0);
+        player.set_speed(f32::INFINITY);
+        player.update(f32::NAN);
+        assert_eq!(player.time(), 0.0);
+        player.update(0.25);
+        assert!((player.time() - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn finite_large_dt_and_speed_keep_loop_cursor_finite() {
+        let target = SceneNode3d::empty();
+        let channel = AnimationChannel::translation(
+            target,
+            vec![0.0, 1.0],
+            vec![Vec3::ZERO, Vec3::X],
+            Interpolation::Linear,
+        );
+        let mut player =
+            AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+        player.play_index(0);
+        player.set_speed(f32::MAX);
+        player.update(f32::MAX);
+
+        assert!(player.time().is_finite());
+        assert!((0.0..1.0).contains(&player.time()));
+    }
+
+    #[test]
+    fn finite_large_reverse_and_non_loop_values_keep_cursor_contract() {
+        let make_player = || {
+            let target = SceneNode3d::empty();
+            let channel = AnimationChannel::translation(
+                target,
+                vec![0.0, 1.0],
+                vec![Vec3::ZERO, Vec3::X],
+                Interpolation::Linear,
+            );
+            let mut player =
+                AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+            player.play_index(0);
+            player
+        };
+
+        let mut looping = make_player();
+        looping.set_speed(-f32::MAX);
+        looping.update(f32::MAX);
+        assert!(looping.time().is_finite());
+        assert!((0.0..1.0).contains(&looping.time()));
+        assert!(looping.is_playing());
+
+        let mut clamped = make_player();
+        clamped.set_looping(false);
+        clamped.set_speed(f32::MAX);
+        clamped.update(f32::MAX);
+        assert_eq!(clamped.time(), 1.0);
+        assert!(!clamped.is_playing());
+    }
+
+    #[test]
+    fn cubic_antipodal_rotation_falls_back_to_a_finite_pose() {
+        let target = SceneNode3d::empty();
+        let channel = AnimationChannel::rotation(
+            target.clone(),
+            vec![0.0, 1.0],
+            vec![
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+                Quat::IDENTITY,
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+                Quat::from_xyzw(0.0, 0.0, 0.0, -1.0),
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+            ],
+            Interpolation::CubicSpline,
+        );
+        let mut player =
+            AnimationPlayer::new(vec![AnimationClip::new("Take".to_string(), vec![channel])]);
+        player.play_index(0);
+        player.seek(0.5);
+
+        assert_eq!(target.rotation(), Quat::IDENTITY);
+        assert!(target.rotation().is_finite());
+
+        player.seek(0.75);
+        assert_eq!(target.rotation(), Quat::from_xyzw(0.0, 0.0, 0.0, -1.0));
+        assert!(target.rotation().is_finite());
     }
 }

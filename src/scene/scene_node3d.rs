@@ -1298,7 +1298,7 @@ impl SceneNode3d {
                             mtl.diffuse[0],
                             mtl.diffuse[1],
                             mtl.diffuse[2],
-                            1.0,
+                            mtl.alpha,
                         ));
 
                         for t in mtl.diffuse_texture.iter() {

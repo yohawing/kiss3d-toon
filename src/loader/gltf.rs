@@ -11,26 +11,230 @@
 //! calling [`load`] directly in most cases.
 
 use crate::color::Color;
+use crate::loader::obj::bounded_warning_text;
 use crate::resource::{
     GpuMesh3d, MaterialManager3d, MorphTargets, SkinVertexData, Texture, TextureManager,
 };
 use crate::scene::{
-    AnimationChannel, AnimationClip, AnimationPlayer, GltfModel, Interpolation, Object3d,
-    SceneNode3d, SkeletonNode3d, Skin3d,
+    AlphaMode, AnimationChannel, AnimationClip, AnimationPlayer, GltfModel, Interpolation,
+    Object3d, SceneNode3d, SkeletonNode3d, Skin3d,
 };
 use glamx::{Mat4, Pose3, Quat, Vec2, Vec3};
-use image::DynamicImage;
+use image::{DynamicImage, ImageFormat, ImageReader};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use std::io::{Cursor, Error as IoError, ErrorKind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+
+const MAX_GLTF_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_GLTF_IMAGE_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GLTF_DECODED_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Validates the number of animation output elements for one glTF channel.
+/// Vector and quaternion channels use one element per key; morph channels use
+/// `components_per_key` scalar weights per key. Cubic-spline channels store
+/// in-tangent, value, and out-tangent for each key.
+pub fn validate_animation_output_cardinality(
+    key_count: usize,
+    cubic_spline: bool,
+    output_count: usize,
+    components_per_key: usize,
+) -> Result<(), String> {
+    let values_per_key = if cubic_spline { 3 } else { 1 };
+    let expected = key_count
+        .checked_mul(values_per_key)
+        .and_then(|count| count.checked_mul(components_per_key))
+        .ok_or_else(|| "glTF animation output cardinality overflowed".to_string())?;
+    if output_count != expected {
+        return Err(format!(
+            "glTF animation output cardinality is {output_count}; expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodedImageBudget {
+    total_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl Default for DecodedImageBudget {
+    fn default() -> Self {
+        Self {
+            total_bytes: 0,
+            max_total_bytes: MAX_GLTF_DECODED_IMAGE_BYTES,
+        }
+    }
+}
+
+impl DecodedImageBudget {
+    fn limits(&self) -> Result<image::Limits, gltf::Error> {
+        let remaining = self.max_total_bytes.saturating_sub(self.total_bytes);
+        if remaining == 0 {
+            return Err(decoded_image_budget_error());
+        }
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_GLTF_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_GLTF_IMAGE_DIMENSION);
+        limits.max_alloc = Some(remaining.min(MAX_GLTF_IMAGE_DECODED_BYTES));
+        Ok(limits)
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<(), gltf::Error> {
+        let bytes = u64::try_from(bytes).map_err(|_| decoded_image_budget_error())?;
+        let next = self
+            .total_bytes
+            .checked_add(bytes)
+            .ok_or_else(decoded_image_budget_error)?;
+        if bytes > MAX_GLTF_IMAGE_DECODED_BYTES || next > self.max_total_bytes {
+            return Err(decoded_image_budget_error());
+        }
+        self.total_bytes = next;
+        Ok(())
+    }
+}
+
+fn decoded_image_budget_error() -> gltf::Error {
+    gltf::Error::Io(IoError::new(
+        ErrorKind::InvalidData,
+        "glTF decoded image budget exceeded",
+    ))
+}
 
 /// One renderable primitive of a glTF mesh: a shareable GPU mesh plus the index
 /// of the material that shades it.
 struct PrimInfo {
     mesh: Rc<RefCell<GpuMesh3d>>,
     material_index: Option<usize>,
+}
+
+/// CPU-owned geometry extracted from one triangle primitive.
+///
+/// This intentionally contains only plain vectors and arrays.  It is a small
+/// first step toward decoding glTF off the event-loop thread; GPU/scene handles
+/// remain in [`build_model`].
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuPrimitive {
+    positions: Vec<[f32; 3]>,
+    faces: Vec<[u32; 3]>,
+    normals: Option<Vec<[f32; 3]>>,
+    uvs: Option<Vec<[f32; 2]>>,
+    material_index: Option<usize>,
+    skin_joints: Option<Vec<[u32; 4]>>,
+    skin_weights: Option<Vec<[f32; 4]>>,
+    morph: Option<CpuMorphTargets>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuMesh {
+    primitives: Vec<CpuPrimitive>,
+    weights: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuNode {
+    parent: Option<usize>,
+    children: Vec<usize>,
+    mesh: Option<usize>,
+    skin: Option<usize>,
+    weights: Vec<f32>,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuImage {
+    decoded: DynamicImage,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuMaterial {
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    emissive: [f32; 3],
+    extensions: MaterialExtensionFactors,
+    base_color_image: Option<usize>,
+    metallic_roughness_image: Option<usize>,
+    normal_image: Option<usize>,
+    occlusion_image: Option<usize>,
+    emissive_image: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuMorphTargets {
+    num_targets: usize,
+    positions: Vec<[f32; 4]>,
+    normals: Option<Vec<[f32; 4]>>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuSkin {
+    joints: Vec<usize>,
+    inverse_bind: Vec<[[f32; 4]; 4]>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum CpuAnimationOutput {
+    Translation(Vec<[f32; 3]>),
+    Scale(Vec<[f32; 3]>),
+    Rotation(Vec<[f32; 4]>),
+    MorphWeights {
+        values: Vec<f32>,
+        num_targets: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuAnimationChannel {
+    target_node: usize,
+    times: Vec<f32>,
+    interpolation: Interpolation,
+    output: CpuAnimationOutput,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CpuAnimationClip {
+    name: String,
+    channels: Vec<CpuAnimationChannel>,
+}
+
+/// Owned CPU-side glTF data for a future worker-thread decode/instantiate path.
+///
+/// Fields remain private until GPU instantiation is exposed; callers should use
+/// [`load`] or [`load_from_slice`] for a renderable model today.
+#[derive(Clone, Debug)]
+pub struct GltfAssetTemplate {
+    #[allow(dead_code)]
+    nodes: Vec<CpuNode>,
+    #[allow(dead_code)]
+    meshes: Vec<CpuMesh>,
+    #[allow(dead_code)]
+    default_scene_roots: Vec<usize>,
+    #[allow(dead_code)]
+    images: Vec<CpuImage>,
+    #[allow(dead_code)]
+    materials: Vec<CpuMaterial>,
+    #[allow(dead_code)]
+    skins: Vec<CpuSkin>,
+    #[allow(dead_code)]
+    animations: Vec<CpuAnimationClip>,
 }
 
 /// Loads a glTF/GLB file into a [`GltfModel`].
@@ -40,17 +244,153 @@ struct PrimInfo {
 /// [`SceneNode3d::add_gltf`](crate::scene::SceneNode3d::add_gltf), which does that
 /// for you). `player` is stopped initially — call
 /// [`AnimationPlayer::play`](crate::scene::AnimationPlayer::play) to start one.
+/// Malformed scene graphs and out-of-range geometry/animation references return
+/// [`gltf::Error`] rather than being accepted as a partial model.
 pub fn load(path: &Path) -> Result<GltfModel, gltf::Error> {
-    let (doc, buffers, images) = gltf::import(path)?;
-    build_model(doc, buffers, images, &path.to_string_lossy())
+    let gltf = gltf::Gltf::open(path)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("./"));
+    let gltf::Gltf { document, blob } = gltf;
+    let buffers = gltf::import_buffers(&document, Some(base), blob)?;
+    catch_unwind(AssertUnwindSafe(|| {
+        let images = import_images_with_budget(&document, Some(base), &buffers)?;
+        build_model(document, buffers, images, &path.to_string_lossy())
+    }))
+    .map_err(|_| loader_panic_error())?
 }
 
 /// Loads a glTF/GLB from an in-memory byte slice — e.g. an `include_bytes!`-embedded,
 /// self-contained `.glb` — for targets without a filesystem such as wasm. See
 /// [`load`] and [`SceneNode3d::add_gltf_from_memory`](crate::scene::SceneNode3d::add_gltf_from_memory).
 pub fn load_from_slice(bytes: &[u8]) -> Result<GltfModel, gltf::Error> {
-    let (doc, buffers, images) = gltf::import_slice(bytes)?;
-    build_model(doc, buffers, images, "gltf_mem")
+    let gltf = gltf::Gltf::from_slice(bytes)?;
+    let gltf::Gltf { document, blob } = gltf;
+    let buffers = gltf::import_buffers(&document, None, blob)?;
+    catch_unwind(AssertUnwindSafe(|| {
+        let images = import_images_with_budget(&document, None, &buffers)?;
+        build_model(document, buffers, images, "gltf_mem")
+    }))
+    .map_err(|_| loader_panic_error())?
+}
+
+/// Decodes a glTF/GLB into an owned CPU template without creating GPU resources.
+/// The template is not yet consumed by [`load`]; it is the safe hand-off seam
+/// for a future worker-thread decode path.
+/// Image dimensions and aggregate decoded image bytes are bounded before the
+/// decoded images are retained in the template.
+/// This API does not enforce the renderer's aggregate source/buffer budget;
+/// callers handling untrusted files must run their source preflight first.
+pub fn decode_cpu(path: &Path) -> Result<GltfAssetTemplate, gltf::Error> {
+    let gltf = gltf::Gltf::open(path)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("./"));
+    let gltf::Gltf { document, blob } = gltf;
+    let buffers = gltf::import_buffers(&document, Some(base), blob)?;
+    catch_unwind(AssertUnwindSafe(|| {
+        let images = import_images_with_budget(&document, Some(base), &buffers)?;
+        decode_cpu_internal(document, buffers, images)
+    }))
+    .map_err(|_| loader_panic_error())?
+}
+
+/// Decodes an in-memory glTF/GLB into an owned CPU template without GPU work.
+/// The returned template is opaque until a future CPU-to-GPU instantiate API is
+/// added; malformed input is reported as [`gltf::Error`]. Image dimensions and
+/// aggregate decoded image bytes are bounded, but the renderer's aggregate
+/// source/buffer budget is not enforced by this standalone API.
+pub fn decode_cpu_from_slice(bytes: &[u8]) -> Result<GltfAssetTemplate, gltf::Error> {
+    let gltf = gltf::Gltf::from_slice(bytes)?;
+    let gltf::Gltf { document, blob } = gltf;
+    let buffers = gltf::import_buffers(&document, None, blob)?;
+    catch_unwind(AssertUnwindSafe(|| {
+        let images = import_images_with_budget(&document, None, &buffers)?;
+        decode_cpu_internal(document, buffers, images)
+    }))
+    .map_err(|_| loader_panic_error())?
+}
+
+fn loader_panic_error() -> gltf::Error {
+    gltf::Error::Io(IoError::new(
+        ErrorKind::InvalidData,
+        "glTF loader rejected malformed document",
+    ))
+}
+
+fn import_images_with_budget(
+    document: &gltf::Document,
+    base: Option<&Path>,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Vec<DynamicImage>, gltf::Error> {
+    let mut budget = DecodedImageBudget::default();
+    document
+        .images()
+        .map(|image| decode_image_source(image.source(), base, buffers, &mut budget))
+        .collect()
+}
+
+fn decode_image_source(
+    source: gltf::image::Source<'_>,
+    base: Option<&Path>,
+    buffers: &[gltf::buffer::Data],
+    budget: &mut DecodedImageBudget,
+) -> Result<DynamicImage, gltf::Error> {
+    let (encoded, uri, mime_type) = match source {
+        gltf::image::Source::View { view, mime_type } => {
+            let buffer_index = view.buffer().index();
+            let buffer = buffers.get(buffer_index).ok_or(gltf::Error::BufferLength {
+                buffer: buffer_index,
+                expected: view.offset().saturating_add(view.length()),
+                actual: 0,
+            })?;
+            let begin = view.offset();
+            let end = begin
+                .checked_add(view.length())
+                .ok_or(gltf::Error::BufferLength {
+                    buffer: buffer_index,
+                    expected: usize::MAX,
+                    actual: buffer.len(),
+                })?;
+            let encoded = buffer.get(begin..end).ok_or(gltf::Error::BufferLength {
+                buffer: buffer_index,
+                expected: end,
+                actual: buffer.len(),
+            })?;
+            (encoded.to_vec(), None, Some(mime_type))
+        }
+        gltf::image::Source::Uri { uri, mime_type } => {
+            let encoded = gltf::buffer::Data::from_source(gltf::buffer::Source::Uri(uri), base)?;
+            (encoded.0, Some(uri), mime_type)
+        }
+    };
+    let format = image_format(uri, mime_type)?;
+    decode_image_bytes(&encoded, format, budget)
+}
+
+fn image_format(uri: Option<&str>, mime_type: Option<&str>) -> Result<ImageFormat, gltf::Error> {
+    let format = if let Some(mime_type) = mime_type {
+        mime_type
+    } else if let Some(uri) = uri.filter(|uri| uri.starts_with("data:")) {
+        uri.strip_prefix("data:")
+            .and_then(|value| value.split(";base64,").next())
+            .unwrap_or("")
+    } else {
+        uri.and_then(|uri| uri.rsplit('.').next()).unwrap_or("")
+    };
+    match format {
+        "image/png" | "png" => Ok(ImageFormat::Png),
+        "image/jpeg" | "jpg" | "jpeg" => Ok(ImageFormat::Jpeg),
+        _ => Err(gltf::Error::UnsupportedImageEncoding),
+    }
+}
+
+fn decode_image_bytes(
+    encoded: &[u8],
+    format: ImageFormat,
+    budget: &mut DecodedImageBudget,
+) -> Result<DynamicImage, gltf::Error> {
+    let mut reader = ImageReader::with_format(Cursor::new(encoded), format);
+    reader.limits(budget.limits()?);
+    let image = reader.decode().map_err(gltf::Error::Image)?;
+    budget.reserve(image.as_bytes().len())?;
+    Ok(image)
 }
 
 /// Builds a [`GltfModel`] from already-imported glTF data. `prefix` namespaces the
@@ -58,14 +398,14 @@ pub fn load_from_slice(bytes: &[u8]) -> Result<GltfModel, gltf::Error> {
 fn build_model(
     doc: gltf::Document,
     buffers: Vec<gltf::buffer::Data>,
-    images: Vec<gltf::image::Data>,
+    images: Vec<DynamicImage>,
     prefix: &str,
 ) -> Result<GltfModel, gltf::Error> {
+    validate_node_hierarchy(&doc)?;
     let prefix = prefix.to_owned();
 
-    // Decode every image once into an `image::DynamicImage`; textures are then
-    // created on demand per (image, color-space) pair.
-    let images: Vec<DynamicImage> = images.iter().map(image_data_to_dynamic).collect();
+    // Images are decoded once; textures are then created on demand per
+    // (image, color-space) pair.
     let mut tex_cache: HashMap<(usize, bool), Arc<Texture>> = HashMap::new();
 
     // Build GPU meshes for every primitive of every mesh, keyed by mesh index.
@@ -77,11 +417,11 @@ fn build_model(
                 log::warn!(
                     "gltf: skipping non-triangle primitive (mode {:?}) in mesh {:?}",
                     prim.mode(),
-                    mesh.name().unwrap_or("")
+                    bounded_warning_text(mesh.name().unwrap_or(""))
                 );
                 continue;
             }
-            if let Some(gpu) = build_primitive(&prim, &buffers) {
+            if let Some(gpu) = build_primitive(&prim, &buffers)? {
                 prims.push(PrimInfo {
                     mesh: Rc::new(RefCell::new(gpu)),
                     material_index: prim.material().index(),
@@ -101,15 +441,40 @@ fn build_model(
         })
         .collect();
 
+    // Resolve every fallible skin and animation decode before registering any
+    // material texture in the global manager. A malformed inverse-bind accessor
+    // or animation channel must not leave a failed load's textures cached.
+    let mut skin_data_by_node = HashMap::new();
+    for node in doc.nodes() {
+        if node.mesh().is_none() {
+            continue;
+        }
+        if let Some(skin) = node.skin() {
+            skin_data_by_node.insert(node.index(), build_skin_parts(&skin, &buffers, &node_map)?);
+        }
+    }
+    let clips = doc
+        .animations()
+        .map(|anim| build_clip(&anim, &buffers, &node_map))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Resolve every material texture source before registering anything in the
+    // global texture manager.  The gltf crate's convenience accessors unwrap
+    // malformed texture/image indices; keep that panic at this fallible,
+    // side-effect-free boundary so a rejected asset cannot leave cached GPU
+    // textures behind.
+    validate_material_texture_sources(&doc, images.len())?;
+
     let material = MaterialManager3d::get_global_manager(|mm| mm.get_default());
     let default_tex = TextureManager::get_global_manager(|tm| tm.get_default());
+    // `Document::materials()` is a forward iterator; calling `nth` for every
+    // primitive makes material binding O(primitives * materials). Keep the
+    // borrowed handles once so lookup is constant-time during graph assembly.
+    let gltf_materials: Vec<_> = doc.materials().collect();
 
     // Attach mesh primitives (as child object nodes) and skins to each node.
     for node in doc.nodes() {
         let Some(mesh) = node.mesh() else { continue };
-        let skin_data = node
-            .skin()
-            .map(|skin| build_skin_parts(&skin, &buffers, &node_map));
 
         for prim in &meshes[mesh.index()] {
             let mut object = Object3d::new(
@@ -118,15 +483,19 @@ fn build_model(
                 default_tex.clone(),
                 material.clone(),
             );
-            if let Some(mat_index) = prim.material_index {
-                if let Some(gltf_mat) = doc.materials().nth(mat_index) {
-                    apply_material(&mut object, &gltf_mat, &images, &mut tex_cache, &prefix);
-                }
+            // A primitive without a material uses glTF's default material,
+            // whose alpha mode is OPAQUE (kiss3d defaults to Blend).
+            let gltf_mat = prim
+                .material_index
+                .and_then(|mat_index| gltf_materials.get(mat_index));
+            object.set_alpha_mode(gltf_alpha_mode_or_default(gltf_mat));
+            if let Some(gltf_mat) = gltf_mat {
+                apply_material(&mut object, gltf_mat, &images, &mut tex_cache, &prefix);
             }
             // A skinned mesh only deforms if it actually carries per-vertex
             // joints/weights; otherwise it stays a rigid child of the node.
             if prim.mesh.borrow().has_skin_vertices() {
-                if let Some((joints, inverse_bind)) = &skin_data {
+                if let Some((joints, inverse_bind)) = skin_data_by_node.get(&node.index()) {
                     object.set_skin(Skin3d::new(joints.clone(), inverse_bind.clone()));
                 }
             }
@@ -193,18 +562,12 @@ fn build_model(
 
     // Assemble the model root from the default (or first) scene's root nodes.
     let mut root = SceneNode3d::empty();
-    let scene = doc.default_scene().or_else(|| doc.scenes().next());
+    let scene = selected_scene(&doc);
     if let Some(scene) = scene {
         for node in scene.nodes() {
             root.add_child(node_map[node.index()].clone());
         }
     }
-
-    // Build the animation clips.
-    let clips = doc
-        .animations()
-        .map(|anim| build_clip(&anim, &buffers, &node_map))
-        .collect();
 
     Ok(GltfModel {
         root,
@@ -212,6 +575,765 @@ fn build_model(
         skeleton_edges,
         skeleton_nodes,
     })
+}
+
+/// Returns the scene rendered by the loader: the authored default scene, or
+/// the first scene when no default is declared.
+fn selected_scene<'a>(doc: &'a gltf::Document) -> Option<gltf::Scene<'a>> {
+    doc.default_scene().or_else(|| doc.scenes().next())
+}
+
+/// Extracts the static scene/geometry subset without creating any GPU or scene
+/// graph values.  The production `load` path deliberately does not call this
+/// yet; keeping it separate makes the future CPU decode boundary testable.
+fn extract_static_template(
+    doc: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+) -> Result<GltfAssetTemplate, gltf::Error> {
+    let node_count = doc.nodes().count();
+    let mut parents = vec![None; node_count];
+    let mut children = vec![Vec::new(); node_count];
+    for node in doc.nodes() {
+        for child in node.children() {
+            parents[child.index()] = Some(node.index());
+            children[node.index()].push(child.index());
+        }
+    }
+
+    // The parent/child tables are only staging data. Move each child list into
+    // the owned DTO instead of cloning it once per node.
+    let mut nodes = Vec::with_capacity(node_count);
+    for node in doc.nodes() {
+        let (translation, rotation, scale) = node.transform().decomposed();
+        let index = node.index();
+        nodes.push(CpuNode {
+            parent: parents[index],
+            children: std::mem::take(&mut children[index]),
+            mesh: node.mesh().map(|mesh| mesh.index()),
+            skin: node.skin().map(|skin| skin.index()),
+            weights: node
+                .weights()
+                .or_else(|| node.mesh().and_then(|mesh| mesh.weights()))
+                .map(|weights| weights.to_vec())
+                .unwrap_or_default(),
+            translation,
+            rotation,
+            scale,
+        });
+    }
+
+    let meshes = doc
+        .meshes()
+        .map(|mesh| {
+            let primitives = mesh
+                .primitives()
+                .map(|primitive| extract_static_primitive(&primitive, buffers))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            Ok::<_, gltf::Error>(CpuMesh {
+                primitives,
+                weights: mesh
+                    .weights()
+                    .map(|weights| weights.to_vec())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let default_scene_roots = selected_scene(doc)
+        .map(|scene| scene.nodes().map(|node| node.index()).collect())
+        .unwrap_or_default();
+
+    Ok(GltfAssetTemplate {
+        nodes,
+        meshes,
+        default_scene_roots,
+        images: Vec::new(),
+        materials: Vec::new(),
+        skins: Vec::new(),
+        animations: Vec::new(),
+    })
+}
+
+/// Extracts triangle geometry into plain CPU-owned arrays.  Unsupported
+/// primitive modes and primitives without positions are skipped just as the
+/// existing GPU builder does.
+fn extract_static_primitive(
+    prim: &gltf::Primitive<'_>,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Option<CpuPrimitive>, gltf::Error> {
+    if prim.mode() != gltf::mesh::Mode::Triangles {
+        return Ok(None);
+    }
+    let reader = prim.reader(|b| Some(&buffers[b.index()]));
+    let Some(positions) = reader.read_positions() else {
+        return Ok(None);
+    };
+    let positions: Vec<[f32; 3]> = positions.collect();
+    let num_vertices = positions.len();
+    let indices = match reader.read_indices() {
+        Some(indices) => indices.into_u32().collect::<Vec<u32>>(),
+        None => (0..num_vertices)
+            .map(|index| {
+                u32::try_from(index).map_err(|_| {
+                    invalid_cpu_template("glTF primitive vertex count exceeds u32 indexing")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let faces = triangle_faces_from_indices(indices)?;
+    let normals = reader.read_normals().map(|values| {
+        values
+            .map(|normal| [normal[0], normal[1], normal[2]])
+            .collect()
+    });
+    let uvs = reader
+        .read_tex_coords(0)
+        .map(|values| values.into_f32().map(|uv| [uv[0], uv[1]]).collect());
+
+    let (skin_joints, skin_weights) = match (reader.read_joints(0), reader.read_weights(0)) {
+        (Some(joints), Some(weights)) => (
+            Some(
+                joints
+                    .into_u16()
+                    .map(|joint| {
+                        [
+                            joint[0] as u32,
+                            joint[1] as u32,
+                            joint[2] as u32,
+                            joint[3] as u32,
+                        ]
+                    })
+                    .collect(),
+            ),
+            Some(weights.into_f32().collect()),
+        ),
+        _ => (None, None),
+    };
+
+    let mut morph_positions = Vec::new();
+    let mut morph_normals = Vec::new();
+    let mut num_targets = 0usize;
+    let mut any_normals = false;
+    for (target_positions, normals, _tangents) in reader.read_morph_targets() {
+        if num_targets >= crate::builtin::deform::MAX_MORPH_TARGETS {
+            break;
+        }
+        num_targets += 1;
+        match target_positions {
+            Some(values) => {
+                morph_positions.extend(values.map(|value| [value[0], value[1], value[2], 0.0]))
+            }
+            None => morph_positions.extend(std::iter::repeat_n([0.0; 4], num_vertices)),
+        }
+        match normals {
+            Some(values) => {
+                any_normals = true;
+                morph_normals.extend(values.map(|value| [value[0], value[1], value[2], 0.0]));
+            }
+            None => morph_normals.extend(std::iter::repeat_n([0.0; 4], num_vertices)),
+        }
+    }
+    let morph = (num_targets > 0).then(|| CpuMorphTargets {
+        num_targets,
+        positions: morph_positions,
+        normals: any_normals.then_some(morph_normals),
+    });
+
+    Ok(Some(CpuPrimitive {
+        positions,
+        faces,
+        normals,
+        uvs,
+        material_index: prim.material().index(),
+        skin_joints,
+        skin_weights,
+        morph,
+    }))
+}
+
+fn triangle_faces_from_indices(indices: Vec<u32>) -> Result<Vec<[u32; 3]>, gltf::Error> {
+    if !indices.len().is_multiple_of(3) {
+        return Err(invalid_cpu_template(
+            "glTF triangle primitive index count is not a multiple of three",
+        ));
+    }
+    Ok(indices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        .collect())
+}
+
+/// Materializes the first CPU-owned template seam shared by the future path
+/// and in-memory decode entry points.  The production loader intentionally
+/// remains on `build_model` until skin/animation metadata is part of this DTO.
+fn decode_cpu_internal(
+    doc: gltf::Document,
+    buffers: Vec<gltf::buffer::Data>,
+    images: Vec<DynamicImage>,
+) -> Result<GltfAssetTemplate, gltf::Error> {
+    validate_node_hierarchy(&doc)?;
+    let mut template = extract_static_template(&doc, &buffers)?;
+    template.images = images
+        .into_iter()
+        .map(|decoded| CpuImage { decoded })
+        .collect();
+    template.materials = doc
+        .materials()
+        .map(|material| {
+            let pbr = material.pbr_metallic_roughness();
+            let factors = material_factors(&material);
+            let base_color_texture = pbr
+                .base_color_texture()
+                .map(|info| info.texture().source().index());
+            let metallic_roughness_texture = pbr
+                .metallic_roughness_texture()
+                .map(|info| info.texture().source().index());
+            let normal_texture = material
+                .normal_texture()
+                .map(|info| info.texture().source().index());
+            let occlusion_texture = material
+                .occlusion_texture()
+                .map(|info| info.texture().source().index());
+            let emissive_texture = material
+                .emissive_texture()
+                .map(|info| info.texture().source().index());
+            CpuMaterial {
+                base_color: factors.base_color,
+                metallic: factors.metallic,
+                roughness: factors.roughness,
+                emissive: factors.emissive,
+                extensions: factors.extensions,
+                base_color_image: base_color_texture,
+                metallic_roughness_image: metallic_roughness_texture,
+                normal_image: normal_texture,
+                occlusion_image: occlusion_texture,
+                emissive_image: emissive_texture,
+            }
+        })
+        .collect();
+    template.skins = extract_cpu_skins(&doc, &buffers);
+    template.animations = extract_cpu_animations(&doc, &buffers)?;
+    validate_cpu_template(&template)?;
+    Ok(template)
+}
+
+fn extract_cpu_skins(doc: &gltf::Document, buffers: &[gltf::buffer::Data]) -> Vec<CpuSkin> {
+    doc.skins()
+        .map(|skin| {
+            let joints: Vec<usize> = skin.joints().map(|joint| joint.index()).collect();
+            let reader = skin.reader(|b| Some(&buffers[b.index()]));
+            let identity = Mat4::IDENTITY.to_cols_array_2d();
+            let inverse_bind = reader
+                .read_inverse_bind_matrices()
+                .map(|values| values.collect())
+                .unwrap_or_else(|| vec![identity; joints.len()]);
+            CpuSkin {
+                joints,
+                inverse_bind,
+            }
+        })
+        .collect()
+}
+
+fn extract_cpu_animations(
+    doc: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Vec<CpuAnimationClip>, gltf::Error> {
+    doc.animations()
+        .map(|animation| {
+            let channels = animation
+                .channels()
+                .map(|channel| extract_cpu_animation_channel(&channel, buffers))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            Ok(CpuAnimationClip {
+                name: animation.name().unwrap_or("").to_string(),
+                channels,
+            })
+        })
+        .collect()
+}
+
+fn extract_cpu_animation_channel(
+    channel: &gltf::animation::Channel<'_>,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Option<CpuAnimationChannel>, gltf::Error> {
+    let interpolation = match channel.sampler().interpolation() {
+        gltf::animation::Interpolation::Linear => Interpolation::Linear,
+        gltf::animation::Interpolation::Step => Interpolation::Step,
+        gltf::animation::Interpolation::CubicSpline => Interpolation::CubicSpline,
+    };
+    let reader = channel.reader(|b| Some(&buffers[b.index()]));
+    let times: Vec<f32> = reader
+        .read_inputs()
+        .ok_or_else(|| invalid_cpu_template("glTF animation channel has no input accessor"))?
+        .collect();
+    let output = match reader
+        .read_outputs()
+        .ok_or_else(|| invalid_cpu_template("glTF animation channel has no output accessor"))?
+    {
+        gltf::animation::util::ReadOutputs::Translations(values) => {
+            let values = values.collect::<Vec<_>>();
+            validate_animation_output_cardinality(
+                times.len(),
+                interpolation == Interpolation::CubicSpline,
+                values.len(),
+                1,
+            )
+            .map_err(invalid_cpu_template)?;
+            CpuAnimationOutput::Translation(values)
+        }
+        gltf::animation::util::ReadOutputs::Scales(values) => {
+            let values = values.collect::<Vec<_>>();
+            validate_animation_output_cardinality(
+                times.len(),
+                interpolation == Interpolation::CubicSpline,
+                values.len(),
+                1,
+            )
+            .map_err(invalid_cpu_template)?;
+            CpuAnimationOutput::Scale(values)
+        }
+        gltf::animation::util::ReadOutputs::Rotations(values) => {
+            let values = values.into_f32().collect::<Vec<_>>();
+            validate_animation_output_cardinality(
+                times.len(),
+                interpolation == Interpolation::CubicSpline,
+                values.len(),
+                1,
+            )
+            .map_err(invalid_cpu_template)?;
+            CpuAnimationOutput::Rotation(values)
+        }
+        gltf::animation::util::ReadOutputs::MorphTargetWeights(values) => {
+            let values: Vec<f32> = values.into_f32().collect();
+            let num_targets = morph_target_count(&channel.target().node()).ok_or_else(|| {
+                invalid_cpu_template("glTF morph animation target has no morph targets")
+            })?;
+            validate_animation_output_cardinality(
+                times.len(),
+                interpolation == Interpolation::CubicSpline,
+                values.len(),
+                num_targets,
+            )
+            .map_err(invalid_cpu_template)?;
+            CpuAnimationOutput::MorphWeights {
+                values,
+                num_targets,
+            }
+        }
+    };
+    Ok(Some(CpuAnimationChannel {
+        target_node: channel.target().node().index(),
+        times,
+        interpolation,
+        output,
+    }))
+}
+
+fn invalid_cpu_template(message: impl Into<String>) -> gltf::Error {
+    gltf::Error::Io(IoError::new(ErrorKind::InvalidData, message.into()))
+}
+
+fn validate_node_hierarchy(doc: &gltf::Document) -> Result<(), gltf::Error> {
+    let node_count = doc.nodes().count();
+    let mut parent_by_node = vec![None; node_count];
+    for node in doc.nodes() {
+        let (translation, rotation, scale) = node.transform().decomposed();
+        validate_node_transform_values(&translation, &rotation, &scale)?;
+        for child in node.children() {
+            let Some(parent) = parent_by_node.get_mut(child.index()) else {
+                return Err(invalid_cpu_template(
+                    "glTF node child index is out of range",
+                ));
+            };
+            if parent.replace(node.index()).is_some() {
+                return Err(invalid_cpu_template(
+                    "glTF node has more than one parent or appears twice",
+                ));
+            }
+        }
+    }
+    validate_parent_graph(&parent_by_node).map_err(invalid_cpu_template)?;
+
+    let scene = selected_scene(doc);
+    if let Some(scene) = scene {
+        let mut roots = HashSet::new();
+        for node in scene.nodes() {
+            if !roots.insert(node.index()) {
+                return Err(invalid_cpu_template(
+                    "glTF scene lists the same root node more than once",
+                ));
+            }
+            if parent_by_node[node.index()].is_some() {
+                return Err(invalid_cpu_template(
+                    "glTF scene root node also has a parent",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_parent_graph(parent_by_node: &[Option<usize>]) -> Result<(), &'static str> {
+    for &parent in parent_by_node.iter().flatten() {
+        if parent >= parent_by_node.len() {
+            return Err("glTF node parent index is out of range");
+        }
+    }
+    let mut state = vec![0_u8; parent_by_node.len()];
+    for start in 0..parent_by_node.len() {
+        if state[start] == 2 {
+            continue;
+        }
+        let mut current = start;
+        let mut path = Vec::new();
+        let mut reached_root = false;
+        while state[current] == 0 {
+            state[current] = 1;
+            path.push(current);
+            let Some(parent) = parent_by_node[current] else {
+                reached_root = true;
+                break;
+            };
+            current = parent;
+        }
+        if !reached_root && state[current] == 1 {
+            return Err("glTF node hierarchy contains a cycle");
+        }
+        for node in path {
+            state[node] = 2;
+        }
+    }
+    Ok(())
+}
+
+fn validate_animation_times(times: &[f32]) -> Result<(), &'static str> {
+    if times.iter().any(|time| !time.is_finite()) {
+        return Err("glTF animation key times must be finite");
+    }
+    if times.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err("glTF animation key times must be non-decreasing");
+    }
+    Ok(())
+}
+
+fn validate_animation_vec3(values: &[Vec3]) -> Result<(), &'static str> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err("glTF animation vector output must be finite");
+    }
+    Ok(())
+}
+
+fn validate_animation_vec3_arrays(values: &[[f32; 3]]) -> Result<(), &'static str> {
+    if !finite_array_values(values) {
+        return Err("glTF animation vector output must be finite");
+    }
+    Ok(())
+}
+
+fn validate_animation_quat(values: &[Quat], cubic_spline: bool) -> Result<(), &'static str> {
+    if values.iter().enumerate().any(|(index, value)| {
+        let length_squared = value.length_squared();
+        !value.is_finite()
+            || !length_squared.is_finite()
+            || (length_squared <= f32::EPSILON && (!cubic_spline || index % 3 == 1))
+    }) {
+        return Err("glTF animation rotation output must be finite and non-zero");
+    }
+    Ok(())
+}
+
+fn validate_animation_quat_arrays(
+    values: &[[f32; 4]],
+    cubic_spline: bool,
+) -> Result<(), &'static str> {
+    if values.iter().enumerate().any(|(index, value)| {
+        let length_squared = value
+            .iter()
+            .map(|component| component * component)
+            .sum::<f32>();
+        !value.iter().all(|component| component.is_finite())
+            || !length_squared.is_finite()
+            || (length_squared <= f32::EPSILON && (!cubic_spline || index % 3 == 1))
+    }) {
+        return Err("glTF animation rotation output must be finite and non-zero");
+    }
+    Ok(())
+}
+
+fn validate_animation_scalars(values: &[f32]) -> Result<(), &'static str> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err("glTF animation scalar output must be finite");
+    }
+    Ok(())
+}
+
+fn validate_cpu_animation_output(
+    output: &CpuAnimationOutput,
+    interpolation: Interpolation,
+) -> Result<(), gltf::Error> {
+    match output {
+        CpuAnimationOutput::Translation(values) | CpuAnimationOutput::Scale(values) => {
+            validate_animation_vec3_arrays(values).map_err(invalid_cpu_template)?;
+        }
+        CpuAnimationOutput::Rotation(values) => {
+            validate_animation_quat_arrays(values, interpolation == Interpolation::CubicSpline)
+                .map_err(invalid_cpu_template)?;
+        }
+        CpuAnimationOutput::MorphWeights { values, .. } => {
+            validate_animation_scalars(values).map_err(invalid_cpu_template)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_finite_array<const N: usize>(
+    values: &[[f32; N]],
+    message: &'static str,
+) -> Result<(), gltf::Error> {
+    if !finite_array_values(values) {
+        return Err(invalid_cpu_template(message));
+    }
+    Ok(())
+}
+
+fn finite_array_values<const N: usize>(values: &[[f32; N]]) -> bool {
+    values
+        .iter()
+        .all(|value| value.iter().all(|component| component.is_finite()))
+}
+
+fn validate_node_transform_values(
+    translation: &[f32; 3],
+    rotation: &[f32; 4],
+    scale: &[f32; 3],
+) -> Result<(), gltf::Error> {
+    validate_finite_array(
+        std::slice::from_ref(translation),
+        "glTF node translation must be finite",
+    )?;
+    validate_finite_array(
+        std::slice::from_ref(rotation),
+        "glTF node rotation must be finite",
+    )?;
+    validate_finite_array(
+        std::slice::from_ref(scale),
+        "glTF node scale must be finite",
+    )?;
+    let rotation = Quat::from_array(*rotation);
+    if !rotation.length_squared().is_finite() || rotation.length_squared() <= f32::EPSILON {
+        return Err(invalid_cpu_template("glTF node rotation must be non-zero"));
+    }
+    Ok(())
+}
+
+fn validate_cpu_primitive_values(primitive: &CpuPrimitive) -> Result<(), gltf::Error> {
+    validate_finite_array(
+        &primitive.positions,
+        "glTF primitive positions must be finite",
+    )?;
+    if let Some(normals) = &primitive.normals {
+        validate_finite_array(normals, "glTF primitive normals must be finite")?;
+    }
+    if let Some(uvs) = &primitive.uvs {
+        validate_finite_array(uvs, "glTF primitive UVs must be finite")?;
+    }
+    if let Some(weights) = &primitive.skin_weights {
+        validate_finite_array(weights, "glTF primitive skin weights must be finite")?;
+    }
+    if let Some(morph) = &primitive.morph {
+        validate_finite_array(
+            &morph.positions,
+            "glTF primitive morph values must be finite",
+        )?;
+        if let Some(normals) = &morph.normals {
+            validate_finite_array(normals, "glTF primitive morph values must be finite")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_cpu_template(template: &GltfAssetTemplate) -> Result<(), gltf::Error> {
+    for node in &template.nodes {
+        validate_node_transform_values(&node.translation, &node.rotation, &node.scale)?;
+        if let Some(mesh) = node.mesh {
+            if mesh >= template.meshes.len() {
+                return Err(invalid_cpu_template("glTF node mesh index is out of range"));
+            }
+        }
+        if let Some(skin) = node.skin {
+            if skin >= template.skins.len() {
+                return Err(invalid_cpu_template("glTF node skin index is out of range"));
+            }
+        }
+    }
+    for mesh in &template.meshes {
+        for primitive in &mesh.primitives {
+            validate_cpu_primitive_values(primitive)?;
+            validate_primitive_geometry(
+                primitive.positions.len(),
+                &primitive.faces,
+                primitive.normals.as_ref().map(Vec::len),
+                primitive.uvs.as_ref().map(Vec::len),
+                primitive.skin_joints.as_ref().map(Vec::len),
+                primitive.skin_weights.as_ref().map(Vec::len),
+                primitive.morph.as_ref().map(|morph| {
+                    (
+                        morph.num_targets,
+                        morph.positions.len(),
+                        morph.normals.as_ref().map(Vec::len),
+                    )
+                }),
+            )
+            .map_err(invalid_cpu_template)?;
+            if let Some(material) = primitive.material_index {
+                if material >= template.materials.len() {
+                    return Err(invalid_cpu_template(
+                        "glTF primitive material index is out of range",
+                    ));
+                }
+            }
+        }
+    }
+    for skin in &template.skins {
+        if skin.inverse_bind.len() != skin.joints.len()
+            || skin
+                .joints
+                .iter()
+                .any(|joint| *joint >= template.nodes.len())
+            || skin
+                .inverse_bind
+                .iter()
+                .flat_map(|matrix| matrix.iter().flatten())
+                .any(|value| !value.is_finite())
+        {
+            return Err(invalid_cpu_template(
+                "glTF skin joints or inverse-bind matrices are invalid",
+            ));
+        }
+    }
+    for clip in &template.animations {
+        for channel in &clip.channels {
+            if channel.target_node >= template.nodes.len() {
+                return Err(invalid_cpu_template(
+                    "glTF animation channel target is invalid",
+                ));
+            }
+            validate_animation_times(&channel.times).map_err(invalid_cpu_template)?;
+            validate_cpu_animation_output(&channel.output, channel.interpolation)?;
+            let key_count = channel.times.len();
+            let factor = usize::from(channel.interpolation == Interpolation::CubicSpline) * 2 + 1;
+            match &channel.output {
+                CpuAnimationOutput::Translation(values) | CpuAnimationOutput::Scale(values) => {
+                    let expected = key_count.checked_mul(factor).ok_or_else(|| {
+                        invalid_cpu_template("glTF animation output count overflowed")
+                    })?;
+                    if values.len() != expected {
+                        return Err(invalid_cpu_template(
+                            "glTF animation vector output count is invalid",
+                        ));
+                    }
+                }
+                CpuAnimationOutput::Rotation(values) => {
+                    let expected = key_count.checked_mul(factor).ok_or_else(|| {
+                        invalid_cpu_template("glTF animation output count overflowed")
+                    })?;
+                    if values.len() != expected {
+                        return Err(invalid_cpu_template(
+                            "glTF animation rotation output count is invalid",
+                        ));
+                    }
+                }
+                CpuAnimationOutput::MorphWeights {
+                    values,
+                    num_targets,
+                } => {
+                    if *num_targets == 0 {
+                        return Err(invalid_cpu_template(
+                            "glTF animation morph target count is zero",
+                        ));
+                    }
+                    let expected = key_count
+                        .checked_mul(*num_targets)
+                        .and_then(|count| count.checked_mul(factor))
+                        .ok_or_else(|| {
+                            invalid_cpu_template("glTF animation morph output count overflowed")
+                        })?;
+                    if values.len() != expected {
+                        return Err(invalid_cpu_template(
+                            "glTF animation morph output count is invalid",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for material in &template.materials {
+        if !material_values_are_finite(material) {
+            return Err(invalid_cpu_template("glTF material factors must be finite"));
+        }
+        let image_indices = [
+            material.base_color_image,
+            material.metallic_roughness_image,
+            material.normal_image,
+            material.occlusion_image,
+            material.emissive_image,
+        ];
+        if image_indices
+            .iter()
+            .flatten()
+            .any(|image| *image >= template.images.len())
+        {
+            return Err(invalid_cpu_template(
+                "glTF material image index is out of range",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_primitive_geometry(
+    vertex_count: usize,
+    faces: &[[u32; 3]],
+    normals_len: Option<usize>,
+    uvs_len: Option<usize>,
+    skin_joints_len: Option<usize>,
+    skin_weights_len: Option<usize>,
+    morph: Option<(usize, usize, Option<usize>)>,
+) -> Result<(), &'static str> {
+    if faces
+        .iter()
+        .flatten()
+        .any(|index| usize::try_from(*index).map_or(true, |index| index >= vertex_count))
+    {
+        return Err("glTF primitive face index is out of range");
+    }
+    if normals_len.is_some_and(|length| length != vertex_count) {
+        return Err("glTF primitive normals do not match vertex count");
+    }
+    if uvs_len.is_some_and(|length| length != vertex_count) {
+        return Err("glTF primitive UVs do not match vertex count");
+    }
+    match (skin_joints_len, skin_weights_len) {
+        (Some(joints), Some(weights)) if joints == vertex_count && weights == vertex_count => {}
+        (None, None) => {}
+        _ => return Err("glTF primitive skin attributes do not match vertex count"),
+    }
+    if let Some((num_targets, positions_len, normals_len)) = morph {
+        let expected = num_targets
+            .checked_mul(vertex_count)
+            .ok_or("glTF morph target count overflowed")?;
+        if positions_len != expected || normals_len.is_some_and(|length| length != expected) {
+            return Err("glTF morph target data does not match vertex count");
+        }
+    }
+    Ok(())
 }
 
 fn joint_edges(
@@ -230,45 +1352,77 @@ fn joint_edges(
 }
 
 /// Reads one triangle primitive into a [`GpuMesh3d`], including optional skinning
-/// attributes. Returns `None` if the primitive has no positions.
-fn build_primitive(prim: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Option<GpuMesh3d> {
+/// attributes. Returns `Ok(None)` if the primitive has no positions and an
+/// explicit error for malformed geometry.
+fn build_primitive(
+    prim: &gltf::Primitive,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Option<GpuMesh3d>, gltf::Error> {
     let reader = prim.reader(|b| Some(&buffers[b.index()]));
 
-    let positions: Vec<Vec3> = reader.read_positions()?.map(Vec3::from_array).collect();
+    let Some(positions) = reader.read_positions() else {
+        return Ok(None);
+    };
+    let positions: Vec<Vec3> = positions.map(Vec3::from_array).collect();
+    if positions.iter().any(|value| !value.is_finite()) {
+        return Err(invalid_cpu_template(
+            "glTF primitive positions must be finite",
+        ));
+    }
     let num_vertices = positions.len();
 
-    let faces: Vec<[u32; 3]> = match reader.read_indices() {
-        Some(indices) => indices
-            .into_u32()
-            .collect::<Vec<u32>>()
-            .chunks_exact(3)
-            .map(|c| [c[0], c[1], c[2]])
-            .collect(),
-        None => (0..positions.len() as u32)
-            .collect::<Vec<u32>>()
-            .chunks_exact(3)
-            .map(|c| [c[0], c[1], c[2]])
-            .collect(),
+    let indices = match reader.read_indices() {
+        Some(indices) => indices.into_u32().collect::<Vec<u32>>(),
+        None => (0..num_vertices)
+            .map(|index| {
+                u32::try_from(index).map_err(|_| {
+                    invalid_cpu_template("glTF primitive vertex count exceeds u32 indexing")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     };
+    let faces = triangle_faces_from_indices(indices)?;
 
     let normals: Option<Vec<Vec3>> = reader
         .read_normals()
         .map(|it| it.map(Vec3::from_array).collect());
+    if normals
+        .as_ref()
+        .is_some_and(|values| values.iter().any(|value| !value.is_finite()))
+    {
+        return Err(invalid_cpu_template(
+            "glTF primitive normals must be finite",
+        ));
+    }
     let uvs: Option<Vec<Vec2>> = reader
         .read_tex_coords(0)
         .map(|it| it.into_f32().map(Vec2::from_array).collect());
-
-    let mut mesh = GpuMesh3d::new(positions, faces, normals, uvs, false);
+    if uvs
+        .as_ref()
+        .is_some_and(|values| values.iter().any(|value| !value.is_finite()))
+    {
+        return Err(invalid_cpu_template("glTF primitive UVs must be finite"));
+    }
 
     // Skinning attributes: present together on skinned primitives. JOINTS_0 is
     // widened from u8/u16 to u32 so a single vertex format covers every mesh.
-    if let (Some(joints), Some(weights)) = (reader.read_joints(0), reader.read_weights(0)) {
-        let joints: Vec<[u32; 4]> = joints
+    let joints = reader.read_joints(0).map(|joints| {
+        joints
             .into_u16()
             .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
-            .collect();
-        let weights: Vec<[f32; 4]> = weights.into_f32().collect();
-        mesh.set_skin_vertices(SkinVertexData::new(joints, weights));
+            .collect::<Vec<_>>()
+    });
+    let weights = reader
+        .read_weights(0)
+        .map(|weights| weights.into_f32().collect::<Vec<_>>());
+    if weights.as_ref().is_some_and(|values| {
+        values
+            .iter()
+            .any(|value| !value.iter().all(|component| component.is_finite()))
+    }) {
+        return Err(invalid_cpu_template(
+            "glTF primitive skin weights must be finite",
+        ));
     }
 
     // Morph targets: per-target position (and optional normal) deltas, flattened to
@@ -300,8 +1454,41 @@ fn build_primitive(prim: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Op
             None => morph_normals.extend(std::iter::repeat_n([0.0; 4], num_vertices)),
         }
     }
-    if num_targets > 0 {
-        let normals = any_normals.then_some(morph_normals);
+    if morph_positions
+        .iter()
+        .chain(morph_normals.iter())
+        .any(|value| !value.iter().all(|component| component.is_finite()))
+    {
+        return Err(invalid_cpu_template(
+            "glTF primitive morph values must be finite",
+        ));
+    }
+    let morph = (num_targets > 0).then(|| {
+        (
+            num_targets,
+            morph_positions,
+            any_normals.then_some(morph_normals),
+        )
+    });
+
+    validate_primitive_geometry(
+        num_vertices,
+        &faces,
+        normals.as_ref().map(Vec::len),
+        uvs.as_ref().map(Vec::len),
+        joints.as_ref().map(Vec::len),
+        weights.as_ref().map(Vec::len),
+        morph.as_ref().map(|(targets, positions, normals)| {
+            (*targets, positions.len(), normals.as_ref().map(Vec::len))
+        }),
+    )
+    .map_err(invalid_cpu_template)?;
+
+    let mut mesh = GpuMesh3d::new(positions, faces, normals, uvs, false);
+    if let (Some(joints), Some(weights)) = (joints, weights) {
+        mesh.set_skin_vertices(SkinVertexData::new(joints, weights));
+    }
+    if let Some((num_targets, morph_positions, normals)) = morph {
         mesh.set_morph_targets(MorphTargets::new(
             num_targets,
             num_vertices,
@@ -310,7 +1497,7 @@ fn build_primitive(prim: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Op
         ));
     }
 
-    Some(mesh)
+    Ok(Some(mesh))
 }
 
 /// Builds the (joint node weak handles, inverse bind matrices) for a glTF skin.
@@ -318,10 +1505,13 @@ fn build_skin_parts(
     skin: &gltf::Skin,
     buffers: &[gltf::buffer::Data],
     node_map: &[SceneNode3d],
-) -> (
-    Vec<std::rc::Weak<RefCell<crate::scene::SceneNodeData3d>>>,
-    Vec<Mat4>,
-) {
+) -> Result<
+    (
+        Vec<std::rc::Weak<RefCell<crate::scene::SceneNodeData3d>>>,
+        Vec<Mat4>,
+    ),
+    gltf::Error,
+> {
     let joints: Vec<_> = skin
         .joints()
         .map(|j| node_map[j.index()].downgrade())
@@ -333,7 +1523,61 @@ fn build_skin_parts(
         None => vec![Mat4::IDENTITY; joints.len()],
     };
 
-    (joints, inverse_bind)
+    if inverse_bind.iter().any(|matrix| !matrix.is_finite()) {
+        return Err(invalid_cpu_template(
+            "glTF skin inverse-bind matrix is not finite",
+        ));
+    }
+
+    Ok((joints, inverse_bind))
+}
+
+fn validate_material_texture_sources(
+    doc: &gltf::Document,
+    image_count: usize,
+) -> Result<(), gltf::Error> {
+    for (material_index, material) in doc.materials().enumerate() {
+        let sources_valid = catch_unwind(AssertUnwindSafe(|| {
+            [
+                material
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .pbr_metallic_roughness()
+                    .metallic_roughness_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .normal_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .occlusion_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .emissive_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .transmission()
+                    .and_then(|transmission| transmission.transmission_texture())
+                    .map(|info| info.texture().source().index()),
+            ]
+            .iter()
+            .flatten()
+            .all(|source| *source < image_count)
+        }))
+        .map_err(|_| {
+            invalid_cpu_template(format!(
+                "glTF material {material_index} has an invalid texture source"
+            ))
+        })?;
+
+        if !sources_valid {
+            return Err(invalid_cpu_template(format!(
+                "glTF material {material_index} texture source is out of range"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Maps a glTF material's metallic-roughness parameters and textures onto an
@@ -346,16 +1590,22 @@ fn apply_material(
     prefix: &str,
 ) {
     let pbr = material.pbr_metallic_roughness();
-    let bc = pbr.base_color_factor();
-    object.set_color(Color::new(bc[0], bc[1], bc[2], bc[3]));
-    object.set_metallic(pbr.metallic_factor());
-    object.set_roughness(pbr.roughness_factor());
-    let extensions = material_extension_factors(material);
-    let ef = material.emissive_factor();
+    let factors = material_factors(material);
+    object.set_color(Color::new(
+        factors.base_color[0],
+        factors.base_color[1],
+        factors.base_color[2],
+        factors.base_color[3],
+    ));
+    object.set_metallic(factors.metallic);
+    object.set_roughness(factors.roughness);
+    object.set_alpha_mode(gltf_alpha_mode(material));
+    let extensions = factors.extensions;
+    let ef = factors.emissive;
     object.set_emissive(Color::new(
-        ef[0] * extensions.emissive_strength,
-        ef[1] * extensions.emissive_strength,
-        ef[2] * extensions.emissive_strength,
+        finite_material_product_or(ef[0], extensions.emissive_strength, 0.0),
+        finite_material_product_or(ef[1], extensions.emissive_strength, 0.0),
+        finite_material_product_or(ef[2], extensions.emissive_strength, 0.0),
         1.0,
     ));
     if let Some(ior) = extensions.ior {
@@ -418,6 +1668,23 @@ fn apply_material(
     }
 }
 
+fn gltf_alpha_mode(material: &gltf::Material<'_>) -> AlphaMode {
+    match material.alpha_mode() {
+        gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+        gltf::material::AlphaMode::Mask => AlphaMode::Mask(
+            material
+                .alpha_cutoff()
+                .filter(|cutoff| cutoff.is_finite())
+                .unwrap_or(0.5),
+        ),
+        gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+    }
+}
+
+fn gltf_alpha_mode_or_default(material: Option<&gltf::Material<'_>>) -> AlphaMode {
+    material.map(gltf_alpha_mode).unwrap_or(AlphaMode::Opaque)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MaterialExtensionFactors {
     emissive_strength: f32,
@@ -426,18 +1693,75 @@ struct MaterialExtensionFactors {
     has_transmission_texture: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MaterialFactors {
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    emissive: [f32; 3],
+    extensions: MaterialExtensionFactors,
+}
+
+fn material_factors(material: &gltf::Material<'_>) -> MaterialFactors {
+    let pbr = material.pbr_metallic_roughness();
+    MaterialFactors {
+        base_color: finite_material_array_or(pbr.base_color_factor(), [1.0, 1.0, 1.0, 1.0]),
+        metallic: finite_material_or(pbr.metallic_factor(), 1.0),
+        roughness: finite_material_or(pbr.roughness_factor(), 1.0),
+        emissive: finite_material_array_or(material.emissive_factor(), [0.0, 0.0, 0.0]),
+        extensions: material_extension_factors(material),
+    }
+}
+
 fn material_extension_factors(material: &gltf::Material<'_>) -> MaterialExtensionFactors {
     let transmission = material.transmission();
     MaterialExtensionFactors {
-        emissive_strength: material.emissive_strength().unwrap_or(1.0),
-        ior: material.ior(),
+        emissive_strength: finite_material_or(material.emissive_strength().unwrap_or(1.0), 1.0),
+        ior: material.ior().filter(|value| value.is_finite()),
         transmission: transmission
             .as_ref()
-            .map(|value| value.transmission_factor()),
+            .map(|value| finite_material_or(value.transmission_factor(), 0.0)),
         has_transmission_texture: transmission
             .and_then(|value| value.transmission_texture())
             .is_some(),
     }
+}
+
+fn finite_material_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn finite_material_array_or<const N: usize>(values: [f32; N], fallback: [f32; N]) -> [f32; N] {
+    std::array::from_fn(|index| finite_material_or(values[index], fallback[index]))
+}
+
+fn finite_material_product_or(value: f32, factor: f32, fallback: f32) -> f32 {
+    let product = value * factor;
+    if product.is_finite() {
+        product
+    } else {
+        fallback
+    }
+}
+
+fn material_values_are_finite(material: &CpuMaterial) -> bool {
+    material.base_color.iter().all(|value| value.is_finite())
+        && material.metallic.is_finite()
+        && material.roughness.is_finite()
+        && material.emissive.iter().all(|value| value.is_finite())
+        && material.extensions.emissive_strength.is_finite()
+        && material
+            .extensions
+            .ior
+            .is_none_or(|value| value.is_finite())
+        && material
+            .extensions
+            .transmission
+            .is_none_or(|value| value.is_finite())
 }
 
 /// Returns the kiss3d texture for a glTF image source in the requested color
@@ -469,7 +1793,7 @@ fn build_clip(
     anim: &gltf::Animation,
     buffers: &[gltf::buffer::Data],
     node_map: &[SceneNode3d],
-) -> AnimationClip {
+) -> Result<AnimationClip, gltf::Error> {
     let name = anim.name().unwrap_or("").to_string();
     let mut channels = Vec::new();
 
@@ -482,108 +1806,466 @@ fn build_clip(
         };
 
         let reader = channel.reader(|b| Some(&buffers[b.index()]));
-        let Some(times) = reader.read_inputs() else {
-            continue;
-        };
+        let times = reader
+            .read_inputs()
+            .ok_or_else(|| invalid_cpu_template("glTF animation channel has no input accessor"))?;
         let times: Vec<f32> = times.collect();
+        validate_animation_times(&times).map_err(invalid_cpu_template)?;
 
-        let Some(outputs) = reader.read_outputs() else {
-            continue;
-        };
+        let outputs = reader
+            .read_outputs()
+            .ok_or_else(|| invalid_cpu_template("glTF animation channel has no output accessor"))?;
         let ch = match outputs {
             gltf::animation::util::ReadOutputs::Translations(it) => {
-                let values = it.map(Vec3::from_array).collect();
+                let values: Vec<Vec3> = it.map(Vec3::from_array).collect();
+                validate_animation_vec3(&values).map_err(invalid_cpu_template)?;
+                validate_animation_output_cardinality(
+                    times.len(),
+                    interp == Interpolation::CubicSpline,
+                    values.len(),
+                    1,
+                )
+                .map_err(invalid_cpu_template)?;
                 AnimationChannel::translation(target, times, values, interp)
             }
             gltf::animation::util::ReadOutputs::Scales(it) => {
-                let values = it.map(Vec3::from_array).collect();
+                let values: Vec<Vec3> = it.map(Vec3::from_array).collect();
+                validate_animation_vec3(&values).map_err(invalid_cpu_template)?;
+                validate_animation_output_cardinality(
+                    times.len(),
+                    interp == Interpolation::CubicSpline,
+                    values.len(),
+                    1,
+                )
+                .map_err(invalid_cpu_template)?;
                 AnimationChannel::scale(target, times, values, interp)
             }
             gltf::animation::util::ReadOutputs::Rotations(rot) => {
-                let values = rot.into_f32().map(Quat::from_array).collect();
+                let values: Vec<Quat> = rot.into_f32().map(Quat::from_array).collect();
+                validate_animation_quat(&values, interp == Interpolation::CubicSpline)
+                    .map_err(invalid_cpu_template)?;
+                validate_animation_output_cardinality(
+                    times.len(),
+                    interp == Interpolation::CubicSpline,
+                    values.len(),
+                    1,
+                )
+                .map_err(invalid_cpu_template)?;
                 AnimationChannel::rotation(target, times, values, interp)
             }
             gltf::animation::util::ReadOutputs::MorphTargetWeights(weights) => {
                 let values: Vec<f32> = weights.into_f32().collect();
+                validate_animation_scalars(&values).map_err(invalid_cpu_template)?;
                 let num_keys = times.len();
-                if num_keys == 0 {
-                    continue;
-                }
-                // glTF packs `num_targets` weights per keyframe (×3 for cubic spline,
-                // which stores in/value/out tangents).
-                let per_key = values.len() / num_keys;
-                let num_targets = if interp == Interpolation::CubicSpline {
-                    per_key / 3
-                } else {
-                    per_key
-                };
-                if num_targets == 0 {
-                    continue;
-                }
+                let num_targets =
+                    morph_target_count(&channel.target().node()).ok_or_else(|| {
+                        invalid_cpu_template("glTF morph animation target has no morph targets")
+                    })?;
+                validate_animation_output_cardinality(
+                    num_keys,
+                    interp == Interpolation::CubicSpline,
+                    values.len(),
+                    num_targets,
+                )
+                .map_err(invalid_cpu_template)?;
                 AnimationChannel::morph_weights(target, times, values, num_targets, interp)
             }
         };
         channels.push(ch);
     }
 
-    AnimationClip::new(name, channels)
+    Ok(AnimationClip::new(name, channels))
 }
 
-/// Converts a decoded glTF image into an `image::DynamicImage`.
-fn image_data_to_dynamic(data: &gltf::image::Data) -> DynamicImage {
-    use gltf::image::Format;
-    let w = data.width;
-    let h = data.height;
-    let px = data.pixels.clone();
-    match data.format {
-        Format::R8 => DynamicImage::ImageLuma8(
-            image::GrayImage::from_raw(w, h, px).expect("gltf: bad R8 image"),
-        ),
-        Format::R8G8 => DynamicImage::ImageLumaA8(
-            image::ImageBuffer::from_raw(w, h, px).expect("gltf: bad R8G8 image"),
-        ),
-        Format::R8G8B8 => DynamicImage::ImageRgb8(
-            image::RgbImage::from_raw(w, h, px).expect("gltf: bad R8G8B8 image"),
-        ),
-        Format::R8G8B8A8 => DynamicImage::ImageRgba8(
-            image::RgbaImage::from_raw(w, h, px).expect("gltf: bad R8G8B8A8 image"),
-        ),
-        // 16-bit and float formats are uncommon for textures; up/down-convert via
-        // the matching image buffer, falling back to an 8-bit RGBA copy.
-        Format::R16 => DynamicImage::ImageLuma16(
-            image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
-                .expect("gltf: bad R16 image"),
-        ),
-        Format::R16G16 => DynamicImage::ImageLumaA16(
-            image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
-                .expect("gltf: bad R16G16 image"),
-        ),
-        Format::R16G16B16 => DynamicImage::ImageRgb16(
-            image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
-                .expect("gltf: bad R16G16B16 image"),
-        ),
-        Format::R16G16B16A16 => DynamicImage::ImageRgba16(
-            image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
-                .expect("gltf: bad R16G16B16A16 image"),
-        ),
-        Format::R32G32B32FLOAT => DynamicImage::ImageRgb32F(
-            image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
-                .expect("gltf: bad RGB32F image"),
-        ),
-        Format::R32G32B32A32FLOAT => DynamicImage::ImageRgba32F(
-            image::ImageBuffer::from_raw(w, h, bytemuck::cast_slice(&px).to_vec())
-                .expect("gltf: bad RGBA32F image"),
-        ),
-    }
+fn morph_target_count(node: &gltf::Node<'_>) -> Option<usize> {
+    let mesh = node.mesh()?;
+    let count = mesh
+        .primitives()
+        .map(|primitive| primitive.morph_targets().len())
+        .max()?;
+    (count > 0).then_some(count)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{joint_edges, material_extension_factors, MaterialExtensionFactors};
+    use super::{
+        decode_cpu_from_slice, decode_image_bytes, extract_static_template,
+        finite_material_product_or, gltf_alpha_mode, gltf_alpha_mode_or_default, image_format,
+        import_images_with_budget, joint_edges, load_from_slice, material_extension_factors,
+        triangle_faces_from_indices, validate_animation_output_cardinality,
+        validate_animation_quat, validate_animation_times, validate_animation_vec3,
+        validate_cpu_template, validate_material_texture_sources, validate_parent_graph,
+        CpuAnimationOutput, CpuImage, CpuMaterial, CpuMesh, CpuMorphTargets, CpuNode, CpuPrimitive,
+        CpuSkin, DecodedImageBudget, GltfAssetTemplate, Interpolation, MaterialExtensionFactors,
+        MAX_GLTF_IMAGE_DIMENSION,
+    };
+    use crate::scene::AlphaMode;
+    use glamx::{Quat, Vec3};
+    use image::{DynamicImage, GenericImageView, ImageFormat};
     use std::collections::HashSet;
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn first_material(json: &str) -> gltf::Gltf {
         gltf::Gltf::from_slice(json.as_bytes()).expect("test glTF should parse")
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn static_template_types_are_send() {
+        assert_send::<CpuPrimitive>();
+        assert_send::<CpuMesh>();
+        assert_send::<CpuNode>();
+        assert_send::<CpuImage>();
+        assert_send::<CpuMaterial>();
+        assert_send::<CpuMorphTargets>();
+        assert_send::<CpuSkin>();
+        assert_send::<CpuAnimationOutput>();
+        assert_send::<GltfAssetTemplate>();
+    }
+
+    #[test]
+    fn animation_output_cardinality_matches_interpolation_contract() {
+        assert!(validate_animation_output_cardinality(2, false, 2, 1).is_ok());
+        assert!(validate_animation_output_cardinality(2, true, 6, 1).is_ok());
+        assert!(validate_animation_output_cardinality(2, false, 6, 3).is_ok());
+        assert!(validate_animation_output_cardinality(2, false, 1, 1).is_err());
+        assert!(validate_animation_output_cardinality(2, true, 2, 1).is_err());
+        assert!(validate_animation_output_cardinality(2, false, 2, 2).is_err());
+    }
+
+    fn fixture_template(bytes: &[u8]) -> GltfAssetTemplate {
+        decode_cpu_from_slice(bytes).expect("template should validate")
+    }
+
+    #[test]
+    fn cpu_decode_preserves_fox_skin_and_animation_metadata() {
+        let template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/Fox.glb"
+        )));
+
+        assert_eq!(template.skins.len(), 1);
+        assert_eq!(template.skins[0].joints.len(), 24);
+        assert_eq!(template.skins[0].inverse_bind.len(), 24);
+        assert_eq!(
+            template
+                .nodes
+                .iter()
+                .filter(|node| node.skin == Some(0))
+                .count(),
+            1
+        );
+
+        let primitive = &template.meshes[0].primitives[0];
+        let joints = primitive
+            .skin_joints
+            .as_ref()
+            .expect("Fox primitive should carry JOINTS_0");
+        let weights = primitive
+            .skin_weights
+            .as_ref()
+            .expect("Fox primitive should carry WEIGHTS_0");
+        assert_eq!(joints.len(), primitive.positions.len());
+        assert_eq!(weights.len(), primitive.positions.len());
+
+        assert_eq!(template.animations.len(), 3);
+        assert!(template
+            .animations
+            .iter()
+            .all(|clip| clip.channels.len() == 21));
+        for clip in &template.animations {
+            assert!(!clip.name.is_empty());
+            for channel in &clip.channels {
+                assert!(channel.target_node < template.nodes.len());
+                assert!(!channel.times.is_empty());
+                assert!(channel.times.iter().all(|time| time.is_finite()));
+                assert!(matches!(
+                    channel.interpolation,
+                    Interpolation::Linear | Interpolation::Step | Interpolation::CubicSpline
+                ));
+                match &channel.output {
+                    CpuAnimationOutput::Translation(values) | CpuAnimationOutput::Scale(values) => {
+                        assert!(!values.is_empty());
+                    }
+                    CpuAnimationOutput::Rotation(values) => assert!(!values.is_empty()),
+                    CpuAnimationOutput::MorphWeights {
+                        values,
+                        num_targets,
+                    } => {
+                        assert!(*num_targets > 0);
+                        assert!(!values.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_decode_preserves_morph_and_animation_cardinality() {
+        let template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/AnimatedMorphCube.glb"
+        )));
+
+        let primitive = &template.meshes[0].primitives[0];
+        let morph = primitive.morph.as_ref().expect("morph targets expected");
+        assert_eq!(morph.num_targets, 2);
+        assert_eq!(
+            morph.positions.len(),
+            morph.num_targets * primitive.positions.len()
+        );
+        if let Some(normals) = &morph.normals {
+            assert_eq!(normals.len(), morph.num_targets * primitive.positions.len());
+        }
+        assert_eq!(template.animations.len(), 1);
+        assert_eq!(template.animations[0].channels.len(), 1);
+        let channel = &template.animations[0].channels[0];
+        assert_eq!(channel.times.len(), 127);
+        assert!(matches!(
+            &channel.output,
+            CpuAnimationOutput::MorphWeights { num_targets: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn cpu_decode_preserves_box_animation_channel_count() {
+        let template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/BoxAnimated.glb"
+        )));
+        assert_eq!(template.animations.len(), 1);
+        assert_eq!(template.animations[0].channels.len(), 2);
+        assert!(template.animations[0]
+            .channels
+            .iter()
+            .all(|channel| !channel.times.is_empty()));
+    }
+
+    #[test]
+    fn cpu_template_validation_rejects_out_of_range_material() {
+        let mut template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/BoxTextured.glb"
+        )));
+        template.meshes[0].primitives[0].material_index = Some(template.materials.len());
+        let error = validate_cpu_template(&template).expect_err("invalid material must reject");
+        assert!(error.to_string().contains("material index"));
+    }
+
+    #[test]
+    fn cpu_template_validation_rejects_non_finite_inverse_bind() {
+        let mut template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/Fox.glb"
+        )));
+        template.skins[0].inverse_bind[0][0][0] = f32::NAN;
+
+        let error = validate_cpu_template(&template)
+            .expect_err("non-finite inverse-bind matrix must reject");
+        assert!(error.to_string().contains("inverse-bind"));
+    }
+
+    #[test]
+    fn cpu_template_validation_rejects_non_finite_primitive_values() {
+        let mut template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/Fox.glb"
+        )));
+        template.meshes[0].primitives[0].positions[0][0] = f32::NAN;
+
+        let error = validate_cpu_template(&template)
+            .expect_err("non-finite primitive position must reject");
+        assert!(error.to_string().contains("positions"));
+    }
+
+    #[test]
+    fn material_numeric_values_fail_closed_before_gpu_upload() {
+        assert_eq!(finite_material_product_or(0.5, 2.0, 0.0), 1.0);
+        assert_eq!(finite_material_product_or(f32::MAX, f32::MAX, 0.0), 0.0);
+
+        let mut template = fixture_template(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/BoxTextured.glb"
+        )));
+        template.materials[0].base_color[0] = f32::INFINITY;
+        let error =
+            validate_cpu_template(&template).expect_err("non-finite material factor must reject");
+        assert!(error.to_string().contains("material factors"));
+    }
+
+    #[test]
+    fn material_texture_source_validation_covers_all_slots_and_boundary() {
+        let gltf = gltf::Gltf::from_slice(
+            br#"{
+                "asset": { "version": "2.0" },
+                "extensionsUsed": ["KHR_materials_transmission"],
+                "extensionsRequired": ["KHR_materials_transmission"],
+                "images": [{ "uri": "unused.png" }],
+                "textures": [{ "source": 0 }],
+                "materials": [{
+                    "pbrMetallicRoughness": {
+                        "baseColorTexture": { "index": 0 },
+                        "metallicRoughnessTexture": { "index": 0 }
+                    },
+                    "normalTexture": { "index": 0 },
+                    "occlusionTexture": { "index": 0 },
+                    "emissiveTexture": { "index": 0 },
+                    "extensions": {
+                        "KHR_materials_transmission": {
+                            "transmissionTexture": { "index": 0 }
+                        }
+                    }
+                }]
+            }"#,
+        )
+        .expect("malformed source index should parse as a document");
+        assert!(validate_material_texture_sources(&gltf.document, 1).is_ok());
+        let error = validate_material_texture_sources(&gltf.document, 0)
+            .expect_err("out-of-range texture source must reject before GPU registration");
+        assert!(error.to_string().contains("texture source"));
+    }
+
+    #[test]
+    fn cpu_decode_rejects_singular_matrix_node_transform() {
+        let error = decode_cpu_from_slice(
+            br#"{
+                "asset": { "version": "2.0" },
+                "nodes": [{
+                    "matrix": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+                }],
+                "scenes": [{ "nodes": [0] }],
+                "scene": 0
+            }"#,
+        )
+        .expect_err("singular node matrix must reject");
+        assert!(error.to_string().contains("node rotation"));
+    }
+
+    #[test]
+    fn cpu_decode_materializes_box_textured_image_and_material_contract() {
+        let template = decode_cpu_from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/BoxTextured.glb"
+        )))
+        .expect("template should validate");
+
+        assert_eq!(template.images.len(), 1);
+        let (width, height) = template.images[0].decoded.dimensions();
+        assert!(width > 0 && height > 0);
+        assert!(!template.images[0].decoded.as_bytes().is_empty());
+
+        assert_eq!(template.materials.len(), 1);
+        let material = &template.materials[0];
+        assert_eq!(material.base_color, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(material.metallic, 0.0);
+        assert_eq!(material.roughness, 1.0);
+        assert_eq!(material.emissive, [0.0, 0.0, 0.0]);
+        assert_eq!(
+            material.extensions,
+            MaterialExtensionFactors {
+                emissive_strength: 1.0,
+                ior: None,
+                transmission: None,
+                has_transmission_texture: false,
+            }
+        );
+        assert_eq!(material.base_color_image, Some(0));
+        assert_eq!(material.metallic_roughness_image, None);
+        assert_eq!(material.normal_image, None);
+        assert_eq!(material.occlusion_image, None);
+        assert_eq!(material.emissive_image, None);
+
+        let primitive_materials: Vec<_> = template
+            .meshes
+            .iter()
+            .flat_map(|mesh| {
+                mesh.primitives
+                    .iter()
+                    .map(|primitive| primitive.material_index)
+            })
+            .collect();
+        assert_eq!(primitive_materials, vec![Some(0)]);
+    }
+
+    #[test]
+    fn static_template_captures_scene_trs_roots_and_geometry() {
+        let gltf = gltf::Gltf::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/gltf/BoxTextured.glb"
+        )))
+        .expect("fixture glTF should parse");
+        let gltf::Gltf { document, blob } = gltf;
+        let buffers = gltf::import_buffers(&document, None, blob).expect("fixture buffers");
+        let template = extract_static_template(&document, &buffers).expect("static template");
+
+        assert_eq!(template.nodes.len(), document.nodes().count());
+        assert_eq!(template.meshes.len(), document.meshes().count());
+        let expected_roots: Vec<_> = document
+            .default_scene()
+            .or_else(|| document.scenes().next())
+            .map(|scene| scene.nodes().map(|node| node.index()).collect())
+            .unwrap_or_default();
+        assert_eq!(template.default_scene_roots, expected_roots);
+
+        for node in document.nodes() {
+            let (translation, rotation, scale) = node.transform().decomposed();
+            let cpu = &template.nodes[node.index()];
+            assert_eq!(cpu.parent, node_parent(&document, node.index()));
+            assert_eq!(
+                cpu.children,
+                node.children()
+                    .map(|child| child.index())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(cpu.mesh, node.mesh().map(|mesh| mesh.index()));
+            let expected_weights = node
+                .weights()
+                .or_else(|| node.mesh().and_then(|mesh| mesh.weights()))
+                .map(|weights| weights.to_vec())
+                .unwrap_or_default();
+            assert_eq!(cpu.weights, expected_weights);
+            assert_eq!(cpu.translation, translation);
+            assert_eq!(cpu.rotation, rotation);
+            assert_eq!(cpu.scale, scale);
+        }
+        for mesh in document.meshes() {
+            assert_eq!(
+                template.meshes[mesh.index()].weights,
+                mesh.weights().unwrap_or(&[])
+            );
+        }
+
+        let mut primitive_count = 0;
+        for mesh in &template.meshes {
+            for primitive in &mesh.primitives {
+                primitive_count += 1;
+                assert!(!primitive.positions.is_empty());
+                assert!(!primitive.faces.is_empty());
+                assert!(primitive
+                    .faces
+                    .iter()
+                    .flatten()
+                    .all(|index| (*index as usize) < primitive.positions.len()));
+                if let Some(normals) = &primitive.normals {
+                    assert_eq!(normals.len(), primitive.positions.len());
+                }
+                if let Some(uvs) = &primitive.uvs {
+                    assert_eq!(uvs.len(), primitive.positions.len());
+                }
+            }
+        }
+        assert!(primitive_count > 0);
+    }
+
+    fn node_parent(document: &gltf::Document, index: usize) -> Option<usize> {
+        document
+            .nodes()
+            .find(|node| node.children().any(|child| child.index() == index))
+            .map(|node| node.index())
     }
 
     #[test]
@@ -650,9 +2332,362 @@ mod tests {
     }
 
     #[test]
+    fn gltf_alpha_modes_map_to_render_contract() {
+        assert_eq!(gltf_alpha_mode_or_default(None), AlphaMode::Opaque);
+
+        let opaque = first_material(
+            r#"{
+                "asset": { "version": "2.0" },
+                "materials": [{ "alphaMode": "OPAQUE" }]
+            }"#,
+        );
+        assert_eq!(
+            gltf_alpha_mode(&opaque.document.materials().next().unwrap()),
+            AlphaMode::Opaque
+        );
+
+        let mask = first_material(
+            r#"{
+                "asset": { "version": "2.0" },
+                "materials": [{ "alphaMode": "MASK", "alphaCutoff": 0.25 }]
+            }"#,
+        );
+        assert_eq!(
+            gltf_alpha_mode(&mask.document.materials().next().unwrap()),
+            AlphaMode::Mask(0.25)
+        );
+
+        let blend = first_material(
+            r#"{
+                "asset": { "version": "2.0" },
+                "materials": [{ "alphaMode": "BLEND" }]
+            }"#,
+        );
+        assert_eq!(
+            gltf_alpha_mode(&blend.document.materials().next().unwrap()),
+            AlphaMode::Blend
+        );
+    }
+
+    #[test]
     fn skeleton_edges_exclude_non_joint_parents_and_mesh_children() {
         let parents = vec![None, Some(0), Some(1), Some(1), Some(2)];
         let joints = HashSet::from([1, 2, 4]);
         assert_eq!(joint_edges(&parents, &joints), vec![(1, 2), (2, 4)]);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("encode test PNG");
+        bytes.into_inner()
+    }
+
+    fn triangle_glb(index: u16) -> Vec<u8> {
+        let json = r#"{
+            "asset":{"version":"2.0"},
+            "buffers":[{"byteLength":44}],
+            "bufferViews":[
+                {"buffer":0,"byteOffset":0,"byteLength":36},
+                {"buffer":0,"byteOffset":36,"byteLength":6}
+            ],
+            "accessors":[
+                {"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]},
+                {"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}
+            ],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],
+            "nodes":[{"mesh":0}],
+            "scenes":[{"nodes":[0]}],
+            "scene":0
+        }"#;
+        let mut json_bytes = json.as_bytes().to_vec();
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+
+        let mut bin = Vec::with_capacity(44);
+        for vertex in [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for component in vertex {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for value in [0_u16, 1, index] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+
+        let total_length = 12 + 8 + json_bytes.len() + 8 + bin.len();
+        let mut glb = Vec::with_capacity(total_length);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(total_length as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json_bytes);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin);
+        glb
+    }
+
+    fn json_glb(json: &str) -> Vec<u8> {
+        let mut json_bytes = json.as_bytes().to_vec();
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+        let total_length = 12 + 8 + json_bytes.len();
+        let mut glb = Vec::with_capacity(total_length);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(total_length as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json_bytes);
+        glb
+    }
+
+    #[test]
+    fn cyclic_node_graph_returns_error_without_panicking() {
+        let bytes = json_glb(
+            r#"{
+                "asset":{"version":"2.0"},
+                "nodes":[{"children":[1]},{"children":[0]}],
+                "scenes":[{"nodes":[0]}],
+                "scene":0
+            }"#,
+        );
+        let result = std::panic::catch_unwind(|| load_from_slice(&bytes));
+        let result = result.expect("malformed node references must not panic");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parent_graph_rejects_cycles_and_out_of_range_links() {
+        assert!(validate_parent_graph(&[None, Some(0), Some(1)]).is_ok());
+        assert!(validate_parent_graph(&[Some(1), Some(0)]).is_err());
+        assert!(validate_parent_graph(&[Some(2)]).is_err());
+    }
+
+    #[test]
+    fn animation_values_reject_non_finite_or_invalid_order() {
+        assert!(validate_animation_times(&[0.0, 0.5, 0.5, 1.0]).is_ok());
+        assert!(validate_animation_times(&[0.0, 1.0, 0.5]).is_err());
+        assert!(validate_animation_times(&[0.0, f32::NAN]).is_err());
+        assert!(validate_animation_vec3(&[Vec3::ZERO, Vec3::ONE]).is_ok());
+        assert!(validate_animation_vec3(&[Vec3::new(f32::INFINITY, 0.0, 0.0)]).is_err());
+        assert!(validate_animation_quat(&[Quat::IDENTITY], false).is_ok());
+        assert!(validate_animation_quat(&[Quat::from_xyzw(0.0, 0.0, 0.0, 0.0)], false).is_err());
+        assert!(validate_animation_quat(
+            &[
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+                Quat::IDENTITY,
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0)
+            ],
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cpu_decode_rejects_out_of_range_triangle_index() {
+        let error = decode_cpu_from_slice(&triangle_glb(3))
+            .expect_err("an index outside the position accessor must reject the asset");
+        assert!(error.to_string().contains("face index"), "{}", error);
+    }
+
+    #[test]
+    fn triangle_index_collection_rejects_partial_triangle() {
+        assert!(triangle_faces_from_indices(vec![0, 1, 2]).is_ok());
+        let error = triangle_faces_from_indices(vec![0, 1, 2, 3])
+            .expect_err("partial triangle index data must reject the asset");
+        assert!(error.to_string().contains("multiple of three"));
+    }
+
+    fn temp_image_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kiss3d-gltf-image-{}-{}.png",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn decoded_image_budget_tracks_decoded_pixels() {
+        let mut budget = DecodedImageBudget::default();
+        let image = decode_image_bytes(&tiny_png(), ImageFormat::Png, &mut budget).unwrap();
+
+        assert_eq!((image.width(), image.height()), (1, 1));
+        assert_eq!(budget.total_bytes, 4);
+    }
+
+    #[test]
+    fn decoded_image_budget_rejects_aggregate_overflow() {
+        let mut budget = DecodedImageBudget {
+            max_total_bytes: 3,
+            ..DecodedImageBudget::default()
+        };
+        let error = decode_image_bytes(&tiny_png(), ImageFormat::Png, &mut budget)
+            .expect_err("aggregate decoded image budget must reject the output");
+
+        assert!(matches!(
+            error,
+            gltf::Error::Image(image::ImageError::Limits(_))
+        ));
+        assert_eq!(budget.total_bytes, 0);
+    }
+
+    #[test]
+    fn decoded_image_budget_rejects_dimensions_before_allocation() {
+        let mut encoded = tiny_png();
+        encoded[16..20].copy_from_slice(&(MAX_GLTF_IMAGE_DIMENSION + 1).to_be_bytes());
+        let crc = crc32(&encoded[12..29]);
+        encoded[29..33].copy_from_slice(&crc.to_be_bytes());
+
+        let error = decode_image_bytes(
+            &encoded,
+            ImageFormat::Png,
+            &mut DecodedImageBudget::default(),
+        )
+        .expect_err("image dimensions over the limit must be rejected");
+
+        assert!(matches!(
+            error,
+            gltf::Error::Image(image::ImageError::Limits(_))
+        ));
+    }
+
+    #[test]
+    fn image_uri_and_buffer_view_sources_decode_without_renderer() {
+        const PNG_BASE64: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "data:application/octet-stream;base64,{PNG_BASE64}", "byteLength": 68 }}],
+                "bufferViews": [{{ "buffer": 0, "byteOffset": 0, "byteLength": 68 }}],
+                "images": [
+                    {{ "uri": "data:image/png;base64,{PNG_BASE64}" }},
+                    {{ "bufferView": 0, "mimeType": "image/png" }}
+                ]
+            }}"#
+        );
+        let gltf = gltf::Gltf::from_slice(json.as_bytes()).expect("test glTF should parse");
+        let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob).unwrap();
+        let images = import_images_with_budget(&gltf.document, None, &buffers).unwrap();
+
+        assert_eq!(images.len(), 2);
+        assert!(images
+            .iter()
+            .all(|image| image.width() == 1 && image.height() == 1));
+    }
+
+    #[test]
+    fn image_relative_and_file_uris_preserve_loader_contract() {
+        let image_path = temp_image_path();
+        let image_bytes = tiny_png();
+        fs::write(&image_path, &image_bytes).expect("write test PNG");
+        let base = image_path.parent().expect("temp image parent");
+        let file_uri = format!("file://{}", image_path.to_string_lossy().replace('\\', "/"));
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "images": [
+                    {{ "uri": "{}" }},
+                    {{ "uri": "{}" }}
+                ]
+            }}"#,
+            image_path.file_name().unwrap().to_string_lossy(),
+            file_uri
+        );
+        let gltf = gltf::Gltf::from_slice(json.as_bytes()).expect("test glTF should parse");
+        let images = import_images_with_budget(&gltf.document, Some(base), &[]).unwrap();
+
+        assert_eq!(images.len(), 2);
+        assert!(images
+            .iter()
+            .all(|image| image.width() == 1 && image.height() == 1));
+        fs::remove_file(image_path).expect("remove test PNG");
+    }
+
+    #[test]
+    fn image_in_glb_bin_blob_decodes_without_external_files() {
+        let image = tiny_png();
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "byteLength": {} }}],
+                "bufferViews": [{{ "buffer": 0, "byteLength": {} }}],
+                "images": [{{ "bufferView": 0, "mimeType": "image/png" }}]
+            }}"#,
+            image.len(),
+            image.len()
+        );
+        let mut json_bytes = json.into_bytes();
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+        let mut bin_bytes = image;
+        while !bin_bytes.len().is_multiple_of(4) {
+            bin_bytes.push(0);
+        }
+        let total_length = 12 + 8 + json_bytes.len() + 8 + bin_bytes.len();
+        let mut glb = Vec::with_capacity(total_length);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(total_length as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json_bytes);
+        glb.extend_from_slice(&(bin_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin_bytes);
+
+        let gltf = gltf::Gltf::from_slice(&glb).expect("test GLB should parse");
+        let gltf::Gltf { document, blob } = gltf;
+        let buffers = gltf::import_buffers(&document, None, blob).unwrap();
+        let images = import_images_with_budget(&document, None, &buffers).unwrap();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!((images[0].width(), images[0].height()), (1, 1));
+    }
+
+    #[test]
+    fn image_format_keeps_png_jpeg_contract() {
+        assert!(matches!(
+            image_format(Some("data:image/png;base64,abc"), None),
+            Ok(ImageFormat::Png)
+        ));
+        assert!(matches!(
+            image_format(Some("texture.jpg"), None),
+            Ok(ImageFormat::Jpeg)
+        ));
+        assert!(matches!(
+            image_format(Some("texture.webp"), None),
+            Err(gltf::Error::UnsupportedImageEncoding)
+        ));
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        bytes.iter().fold(0xffff_ffff, |mut crc, byte| {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+            crc
+        }) ^ 0xffff_ffff
     }
 }

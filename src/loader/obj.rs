@@ -9,6 +9,8 @@ use glamx::{Vec2, Vec3};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Error;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Result as IoResult;
 use std::iter::Filter;
@@ -26,6 +28,30 @@ pub type UV = Vec2;
 
 /// Iterator through words.
 pub type Words<'a> = Filter<Split<'a, fn(char) -> bool>, fn(&&str) -> bool>;
+
+pub(crate) const MAX_WARNING_TEXT_BYTES: usize = 256;
+pub(crate) const MAX_TEXT_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+
+pub(crate) fn read_bounded_text_file(path: &Path, format: &str) -> IoResult<String> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() > MAX_TEXT_SOURCE_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{format} source exceeds {MAX_TEXT_SOURCE_BYTES} bytes"),
+        ));
+    }
+
+    let mut text = String::new();
+    file.take(MAX_TEXT_SOURCE_BYTES.saturating_add(1))
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_TEXT_SOURCE_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{format} source exceeds {MAX_TEXT_SOURCE_BYTES} bytes"),
+        ));
+    }
+    Ok(text)
+}
 
 // TODO: replace by split_whitespaces from rust 1.1
 /// Returns an iterator through all the words of a string.
@@ -47,8 +73,24 @@ fn error(line: usize, err: &str) -> ! {
     panic!("At line {}: {}", line, err)
 }
 
+pub(crate) fn bounded_warning_text(value: &str) -> String {
+    let mut bounded = String::new();
+    for character in value.chars() {
+        let character = if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_WARNING_TEXT_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
 fn warn(line: usize, err: &str) {
-    log::warn!("at line {}: {}", line, err)
+    log::warn!("at line {}: {}", line, bounded_warning_text(err))
 }
 
 /// Parses an OBJ file and returns the meshes it contains.
@@ -83,14 +125,7 @@ pub fn parse_file(
     mtl_base_dir: &Path,
     basename: &str,
 ) -> IoResult<Vec<(String, GpuMesh3d, Option<MtlMaterial>)>> {
-    match File::open(path) {
-        Ok(mut file) => {
-            let mut sfile = String::new();
-            file.read_to_string(&mut sfile)
-                .map(|_| parse(&sfile[..], mtl_base_dir, basename))
-        }
-        Err(e) => Err(e),
-    }
+    read_bounded_text_file(path, "OBJ").map(|sfile| parse(&sfile, mtl_base_dir, basename))
 }
 
 /// Index triplet for a face vertex: (coord_idx, uv_idx, normal_idx)
@@ -124,6 +159,7 @@ pub fn parse(
     mtl_base_dir: &Path,
     basename: &str,
 ) -> Vec<(String, GpuMesh3d, Option<MtlMaterial>)> {
+    let string = string.strip_prefix('\u{feff}').unwrap_or(string);
     let mut coords: Vec<Coord> = Vec::new();
     let mut normals: Vec<Normal> = Vec::new();
     let mut uvs: Vec<UV> = Vec::new();
@@ -149,7 +185,38 @@ pub fn parse(
         }
 
         match w {
-            "v" => coords.push(parse_v_or_vn(l, words)),
+            "v" => {
+                let mut coordinate = parse_v_or_vn(l, &mut words);
+                if let Some(w_token) = words.next() {
+                    if words.next().is_none() {
+                        let w: f32 = w_token.parse().unwrap_or_else(|parse_error| {
+                            error(
+                                l,
+                                &format!(
+                                    "failed to parse homogeneous vertex w `{}` as a f32: {}",
+                                    w_token, parse_error
+                                ),
+                            )
+                        });
+                        if !w.is_finite() || w == 0.0 {
+                            error(l, "vertex homogeneous w must be finite and non-zero");
+                        }
+                        coordinate /= w;
+                        if !coordinate.is_finite() {
+                            error(
+                                l,
+                                "homogeneous vertex divide produced a non-finite coordinate",
+                            );
+                        }
+                    } else {
+                        warn(
+                            l,
+                            "additional vertex attributes (including colors) are not supported; keeping position only",
+                        );
+                    }
+                }
+                coords.push(coordinate);
+            }
             "vn" => {
                 if !ignore_normals {
                     normals.push(parse_v_or_vn(l, words))
@@ -191,16 +258,20 @@ pub fn parse(
                 )
             }
             _ => {
-                log::warn!("unknown line {} ignored: `{}'", l, line);
+                log::warn!(
+                    "unknown line {} ignored: `{}'",
+                    l,
+                    bounded_warning_text(line)
+                );
             }
         }
     }
 
-    if uvs.is_empty() && ignore_uvs {
+    if ignore_uvs {
         log::warn!("some texture coordinates are missing. Dropping texture coordinates infos for every vertex.");
     }
 
-    if normals.is_empty() && ignore_normals {
+    if ignore_normals {
         log::warn!("some normals are missing. Dropping normals infos for every vertex.");
     }
 
@@ -292,7 +363,10 @@ fn parse_mtllib<'a>(
     }
 }
 
-fn parse_v_or_vn(l: usize, mut ws: Words) -> Vec3 {
+fn parse_v_or_vn<'a, I>(l: usize, mut ws: I) -> Vec3
+where
+    I: Iterator<Item = &'a str>,
+{
     let sx = ws
         .next()
         .unwrap_or_else(|| error(l, "3 components were expected, found 0."));
@@ -303,18 +377,24 @@ fn parse_v_or_vn(l: usize, mut ws: Words) -> Vec3 {
         .next()
         .unwrap_or_else(|| error(l, "3 components were expected, found 2."));
 
-    let x: Result<f32, _> = FromStr::from_str(sx);
-    let y: Result<f32, _> = FromStr::from_str(sy);
-    let z: Result<f32, _> = FromStr::from_str(sz);
-
-    let x =
-        x.unwrap_or_else(|e| error(l, &format!("failed to parse `{}' as a f32: {}", sx, e)[..]));
-    let y =
-        y.unwrap_or_else(|e| error(l, &format!("failed to parse `{}' as a f32: {}", sy, e)[..]));
-    let z =
-        z.unwrap_or_else(|e| error(l, &format!("failed to parse `{}' as a f32: {}", sz, e)[..]));
+    let x = parse_f32(l, sx);
+    let y = parse_f32(l, sy);
+    let z = parse_f32(l, sz);
 
     Vec3::new(x, y, z)
+}
+
+fn parse_f32(line: usize, token: &str) -> f32 {
+    let value: f32 = FromStr::from_str(token).unwrap_or_else(|error_value| {
+        error(
+            line,
+            &format!("failed to parse `{}` as a f32: {}", token, error_value),
+        )
+    });
+    if !value.is_finite() {
+        error(line, &format!("`{token}` must be finite"));
+    }
+    value
 }
 
 fn parse_f<'a>(
@@ -329,6 +409,7 @@ fn parse_f<'a>(
     curr_group: usize,
 ) {
     // Four formats possible: v   v/t   v//n   v/t/n
+    let face_start = groups_ids[curr_group].len();
     let mut i = 0;
     for word in ws {
         let mut coord_idx = i32::MAX;
@@ -356,7 +437,7 @@ fn parse_f<'a>(
         if i > 2 {
             // on the fly triangulation as triangle fan
             let g = &mut groups_ids[curr_group];
-            let p1 = g[g.len() - i];
+            let p1 = g[face_start];
             let p2 = g[g.len() - 1];
             g.push(p1);
             g.push(p2);
@@ -412,13 +493,8 @@ fn parse_vt(l: usize, mut ws: Words) -> UV {
         .next()
         .unwrap_or_else(|| error(l, "at least 2 components were expected, found 1."));
 
-    let x: Result<f32, _> = FromStr::from_str(sx);
-    let y: Result<f32, _> = FromStr::from_str(sy);
-
-    let x =
-        x.unwrap_or_else(|e| error(l, &format!("failed to parse `{}' as a f32: {}", sx, e)[..]));
-    let y =
-        y.unwrap_or_else(|e| error(l, &format!("failed to parse `{}' as a f32: {}", sy, e)[..]));
+    let x = parse_f32(l, sx);
+    let y = parse_f32(l, sy);
 
     Vec2::new(x, y)
 }
@@ -545,4 +621,186 @@ fn reformat(
     }
 
     meshes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, parse_f, parse_file, split_words, MAX_TEXT_SOURCE_BYTES};
+    use glamx::{Vec2, Vec3};
+    use std::fs::{self, File};
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn polygon_triangulation_keeps_each_face_anchor_and_attributes() {
+        let coords = vec![Vec3::ZERO; 9];
+        let uvs = vec![Vec2::ZERO; 9];
+        let normals = vec![Vec3::ZERO; 9];
+        let mut ignore_uvs = false;
+        let mut ignore_normals = false;
+        let mut groups = vec![Vec::new()];
+
+        parse_f(
+            0,
+            split_words("1/1/1 2/2/2 3/3/3 4/4/4 5/5/5"),
+            &coords,
+            &uvs,
+            &normals,
+            &mut ignore_uvs,
+            &mut ignore_normals,
+            &mut groups,
+            0,
+        );
+        parse_f(
+            0,
+            split_words("-4/-4/-4 -3/-3/-3 -2/-2/-2 -1/-1/-1"),
+            &coords,
+            &uvs,
+            &normals,
+            &mut ignore_uvs,
+            &mut ignore_normals,
+            &mut groups,
+            0,
+        );
+
+        let coordinates: Vec<_> = groups[0].iter().map(|vertex| vertex.coord).collect();
+        let uvs: Vec<_> = groups[0].iter().map(|vertex| vertex.uv).collect();
+        let normals: Vec<_> = groups[0].iter().map(|vertex| vertex.normal).collect();
+        let expected = vec![0, 1, 2, 0, 2, 3, 0, 3, 4, 5, 6, 7, 5, 7, 8];
+        assert_eq!(coordinates, expected);
+        assert_eq!(uvs, expected);
+        assert_eq!(normals, expected);
+        assert!(!ignore_uvs);
+        assert!(!ignore_normals);
+        assert_eq!(
+            groups[0].first().copied().map(|vertex| vertex.coord),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn mixed_attributes_recompute_without_indexing_missing_values() {
+        let obj = "v 0 0 0\n\
+v 1 0 0\n\
+v 0 1 0\n\
+v 0 0 1\n\
+v 1 0 1\n\
+v 0 1 1\n\
+vt 0 0\n\
+vt 1 0\n\
+vt 0 1\n\
+vn 0 0 1\n\
+f 1/1/1 2/2/1 3/3/1\n\
+f 4 5 6\n";
+
+        let meshes = parse(obj, Path::new("."), "mixed-normals");
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].1.normals().read().unwrap().len(), 6);
+        assert_eq!(meshes[0].1.uvs().read().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn vertex_color_components_keep_position_with_explicit_unsupported_warning_contract() {
+        let obj = "v 0 0 0 1 0 0\n\
+v 1 0 0 0 1 0\n\
+v 0 1 0 0 0 1\n\
+f 1 2 3\n";
+
+        let meshes = parse(obj, Path::new("."), "vertex-colors");
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].1.coords().read().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn homogeneous_vertex_w_is_applied_before_mesh_build() {
+        let obj = "v 2 4 6 2\n\
+v 1 0 0\n\
+v 0 1 0\n\
+f 1 2 3\n";
+
+        let meshes = parse(obj, Path::new("."), "homogeneous-w");
+        let coordinates = meshes[0].1.coords().read().unwrap();
+        let coordinates = coordinates.data().as_ref().unwrap();
+        assert_eq!(coordinates[0], Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn small_nonzero_homogeneous_w_is_valid() {
+        let obj = "v 1e-8 2e-8 3e-8 1e-8\n\
+v 1 0 0\n\
+v 0 1 0\n\
+f 1 2 3\n";
+
+        let meshes = parse(obj, Path::new("."), "small-homogeneous-w");
+        let coordinates = meshes[0].1.coords().read().unwrap();
+        let coordinates = coordinates.data().as_ref().unwrap();
+        assert_eq!(coordinates[0], Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "homogeneous vertex divide produced a non-finite coordinate")]
+    fn homogeneous_divide_overflow_is_rejected() {
+        let obj = "v 3.4e38 0 0 1e-6\n\
+v 1 0 0\n\
+v 0 1 0\n\
+f 1 2 3\n";
+
+        let _ = parse(obj, Path::new("."), "overflowing-homogeneous-w");
+    }
+
+    #[test]
+    fn non_finite_vertex_attributes_are_rejected_before_mesh_build() {
+        for (source, label) in [
+            ("v NaN 0 0\n", "non-finite-position"),
+            ("vn 0 inf 0\n", "non-finite-normal"),
+            ("vt 0 -inf\n", "non-finite-uv"),
+        ] {
+            let result = std::panic::catch_unwind(|| parse(source, Path::new("."), label));
+            assert!(result.is_err(), "{} should be rejected", label);
+        }
+    }
+
+    #[test]
+    fn obj_and_mtl_file_loaders_reject_oversized_text_before_reading() {
+        let path = std::env::temp_dir().join(format!(
+            "kiss3d-text-budget-{}-{}.obj",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let file = File::create(&path).expect("temporary source should be creatable");
+        file.set_len(MAX_TEXT_SOURCE_BYTES + 1)
+            .expect("temporary source should be sparse-expandable");
+        drop(file);
+
+        let obj_error = parse_file(&path, Path::new("."), "oversized")
+            .err()
+            .expect("oversized OBJ must be rejected");
+        assert!(obj_error.to_string().contains("source exceeds"));
+        let mtl_error = crate::loader::mtl::parse_file(&path)
+            .err()
+            .expect("oversized MTL must be rejected");
+        assert!(mtl_error.to_string().contains("source exceeds"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn utf8_bom_does_not_drop_first_obj_or_mtl_declaration() {
+        let meshes = parse(
+            "\u{feff}v 0 0 0\n\
+v 1 0 0\n\
+v 0 1 0\n\
+f 1 2 3\n",
+            Path::new("."),
+            "bom",
+        );
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].1.coords().read().unwrap().len(), 3);
+
+        let materials = crate::loader::mtl::parse("\u{feff}newmtl bom\nKd 1 0 0\n");
+        assert_eq!(materials.len(), 1);
+        assert_eq!(materials[0].name, "bom");
+    }
 }
