@@ -537,6 +537,7 @@ impl Window {
         // Create a light collection for this frame
         let mut lights = LightCollection::with_ambient(self.ambient_intensity);
         lights.ambient_color = self.ambient_color;
+        lights.additive_ambient = self.additive_ambient;
         lights.fog = self.fog;
 
         // Reflection-probe runtime capture (queued via `capture_reflection_probe`).
@@ -578,6 +579,7 @@ impl Window {
                     MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
                     let mut cap_lights = LightCollection::with_ambient(self.ambient_intensity);
                     cap_lights.ambient_color = self.ambient_color;
+                    cap_lights.additive_ambient = self.additive_ambient;
                     cap_lights.fog = self.fog;
                     if let Some(scene) = scene.as_deref_mut() {
                         scene
@@ -1533,6 +1535,7 @@ impl Window {
         // (`prepare` does both; the path tracer reads geometry off the CPU side.)
         let mut lights = LightCollection::with_ambient(self.ambient_intensity);
         lights.ambient_color = self.ambient_color;
+        lights.additive_ambient = self.additive_ambient;
         lights.fog = self.fog;
         scene.data_mut().prepare(0, camera, &mut lights, w, h);
         // Refresh skinned-mesh joint palettes so the path tracer gathers the
@@ -1829,6 +1832,7 @@ impl Window {
         MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
         let mut lights = LightCollection::with_ambient(self.ambient_intensity);
         lights.ambient_color = self.ambient_color;
+        lights.additive_ambient = self.additive_ambient;
         lights.fog = self.fog;
         scene.data_mut().prepare(0, camera, &mut lights, w, h);
         scene.update_deformations();
@@ -1891,6 +1895,7 @@ impl Window {
             MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
             let mut mlights = LightCollection::with_ambient(self.ambient_intensity);
             mlights.ambient_color = self.ambient_color;
+            mlights.additive_ambient = self.additive_ambient;
             mlights.fog = self.fog;
             scene.data_mut().prepare(0, &mut mcam, &mut mlights, w, h);
             scene.update_deformations();

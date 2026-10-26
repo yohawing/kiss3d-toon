@@ -53,7 +53,9 @@ struct FrameUniforms {
     lights: array<LightData, MAX_LIGHTS>,
     num_lights: u32,
     ambient_intensity: f32,
-    _padding: vec2<f32>,
+    // 1.0: the flat ambient is additive diffuse irradiance (see `shade`).
+    ambient_additive: f32,
+    _padding: f32,
     ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     // (mode, param_a, param_b, height_falloff): mode 0 off / 1 linear / 2 exp / 3 exp2.
@@ -1315,6 +1317,14 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // only in their respective variants (`ibl`, `probes`); with both off only the
     // flat term remains and the env/probe sampling helpers + bindings strip away.
     var ambient = frame.ambient_color.rgb * frame.ambient_intensity * albedo * ao;
+    // Additive mode (`Window::set_additive_ambient`): a uniform diffuse irradiance
+    // like three.js's AmbientLight — metals get none, and it is added to IBL/probe
+    // lighting below instead of being replaced by it.
+    let additive_ambient = frame.ambient_additive > 0.5;
+    if additive_ambient {
+        ambient = ambient * (1.0 - metallic);
+    }
+    let ambient_extra = select(vec3<f32>(0.0), ambient, additive_ambient);
     // The environment specular reflection (the skybox mirrored on the surface),
     // kept separate so refractive glass can layer it ON TOP of the refracted
     // background instead of mixing it away — this is what makes `reflectance` grow
@@ -1378,7 +1388,7 @@ fn shade(in: VertexOutput) -> vec4<f32> {
             let f = fresnel_schlick_roughness(nov, F0, roughness);
             let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
             let spec_env = prefiltered * env_brdf_approx(F0, roughness, nov);
-            ambient = (kd * irradiance * albedo + spec_env) * ao;
+            ambient = (kd * irradiance * albedo + spec_env) * ao + ambient_extra;
             env_reflection = spec_env * ao;
             // Clearcoat: a sharp dielectric (F0 = 0.04) env-reflection lobe layered on
             // top. Its directional Fresnel attenuates the base layer beneath it, and the
