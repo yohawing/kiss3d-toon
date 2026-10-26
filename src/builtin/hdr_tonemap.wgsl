@@ -2,11 +2,13 @@
 //
 // Reads the linear HDR scene texture (`Rgba16Float`), additively composites the
 // blurred bloom texture, applies an exposure multiplier, then the selected
-// tonemap operator + gamma via the shared `apply_tonemap`, imported from the
+// tonemap operator via the shared `tonemap_display`, imported from the
 // `tonemap_ops` WESL module (which also declares the Tony McMapface LUT at
-// group(0) bindings 6 & 7), and writes the LDR result to the output view.
+// group(0) bindings 6 & 7), encodes it with the output transfer (pow(1/2.2) by
+// default, or the exact sRGB OETF) and writes the LDR result to the output view.
 
-import package::tonemap_ops::apply_tonemap;
+import package::tonemap_ops::tonemap_display;
+import package::tonemap_ops::srgb_oetf;
 import package::common::luminance;
 
 struct TonemapUniforms {
@@ -22,6 +24,8 @@ struct TonemapUniforms {
     white_balance: vec4<f32>,
     // (saturation, contrast, gamma, hue).
     grading: vec4<f32>,
+    // x: output transfer (0 = pow(1/2.2), 1 = sRGB OETF); yzw unused.
+    output: vec4<f32>,
 };
 
 // Artistic color grading in linear HDR space: white balance, hue rotation,
@@ -106,5 +110,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Forward the scene alpha, unless force-opaque is set for on-screen surfaces
     // (a transparent canvas would show the page through it on some browsers).
     let out_a = select(scene.a, 1.0, u.white_balance.w > 0.5);
-    return vec4<f32>(apply_tonemap(hdr, u.tonemap_op), out_a);
+    let display = tonemap_display(hdr, u.tonemap_op);
+    var encoded = pow(display, vec3<f32>(1.0 / 2.2));
+    if u.output.x > 0.5 {
+        encoded = srgb_oetf(display);
+    }
+    return vec4<f32>(encoded, out_a);
 }

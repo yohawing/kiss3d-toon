@@ -85,9 +85,9 @@ fn tm_tony(hdr: vec3<f32>) -> vec3<f32> {
     return textureSampleLevel(tony_lut, tony_samp, uv, 0.0).rgb;
 }
 
-// Applies operator `op` to a LINEAR HDR color and gamma-encodes for the non-sRGB
-// output surface.
-fn apply_tonemap(hdr: vec3<f32>, op: u32) -> vec3<f32> {
+// Applies operator `op` to a LINEAR HDR color; returns the LINEAR display color
+// in [0, 1] before any output encoding.
+fn tonemap_display(hdr: vec3<f32>, op: u32) -> vec3<f32> {
     var c: vec3<f32>;
     if (op == 1u) {
         c = tm_aces(hdr);
@@ -102,5 +102,19 @@ fn apply_tonemap(hdr: vec3<f32>, op: u32) -> vec3<f32> {
     } else {
         c = clamp(hdr, vec3<f32>(0.0), vec3<f32>(1.0));
     }
-    return pow(c, vec3<f32>(1.0 / 2.2));
+    return c;
+}
+
+// The exact piecewise sRGB OETF (IEC 61966-2-1), as three.js `LinearTosRGB`.
+fn srgb_oetf(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+
+// Applies operator `op` to a LINEAR HDR color and gamma-encodes (pow 1/2.2) for
+// the non-sRGB output surface.
+fn apply_tonemap(hdr: vec3<f32>, op: u32) -> vec3<f32> {
+    return pow(tonemap_display(hdr, op), vec3<f32>(1.0 / 2.2));
 }
