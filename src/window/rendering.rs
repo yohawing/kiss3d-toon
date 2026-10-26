@@ -21,11 +21,11 @@ use super::{RenderFrameStatus, SurfaceAcquire, Window};
 /// Grace period during which the first frame keeps retrying surface acquisition
 /// before giving up. A freshly created window — particularly on macOS — may need
 /// the event loop to be pumped a few times before its surface is presentable.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Delay between surface acquisition attempts while waiting for the first frame.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 fn should_retry_surface_startup(outcome: &SurfaceAcquire) -> bool {
@@ -277,18 +277,20 @@ impl Window {
                     suboptimal,
                 } => (Some(texture), suboptimal),
                 SurfaceAcquire::Skip(reason) => {
+                    self.discard_queued_draws();
                     return if self.should_close() {
                         RenderFrameStatus::Closed
                     } else {
                         RenderFrameStatus::Skipped(reason)
-                    }
+                    };
                 }
                 SurfaceAcquire::Unavailable(reason) => {
+                    self.discard_queued_draws();
                     return if self.should_close() {
                         RenderFrameStatus::Closed
                     } else {
                         RenderFrameStatus::SurfaceUnavailable(reason)
-                    }
+                    };
                 }
             }
         };
@@ -309,6 +311,7 @@ impl Window {
         // clears the surface, preventing pixels from the previous layout from
         // leaking behind DOM panels.
         if configured_viewport && render_viewport.is_none() {
+            self.discard_queued_draws();
             let frame = frame.expect("visible windows acquire a surface frame");
             let surface_view = frame
                 .texture
@@ -335,10 +338,8 @@ impl Window {
         // No need to update the light position here - it's computed per-frame
         // in the material's prepare() based on the camera position
 
-        // `OffscreenBuffers` are never multisampled, so offscreen rendering
-        // always uses a single sample (a hidden window is not antialiased).
         let render_offscreen = offscreen || render_viewport.is_some();
-        let sample_count = if render_offscreen {
+        let sample_count = if render_viewport.is_some() {
             1
         } else {
             self.canvas.sample_count()
@@ -401,10 +402,9 @@ impl Window {
         let color_view = self.hdr.scene_render_view().clone();
         let resolve_view = self.hdr.scene_resolve_view().cloned();
 
-        // The depth attachment must match the scene target's sample count. The
-        // canvas depth texture is built MSAA-aware; offscreen rendering is always
-        // single-sampled and uses the offscreen target's depth.
-        let depth_view = if render_offscreen {
+        // Partial viewports use their own single-sample depth; full-size and
+        // headless rendering use the canvas depth with its configured MSAA.
+        let depth_view = if render_viewport.is_some() {
             self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
@@ -456,27 +456,30 @@ impl Window {
         // Supply the skybox environment to the default material for image-based
         // lighting (or clear it when no skybox is set).
         {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut mat = default_mat.borrow_mut();
-            if let Some(env) = self.skybox.ibl_env() {
-                mat.set_environment_lighting(Some(crate::resource::EnvLight {
-                    view: &env.view,
-                    sampler: &env.sampler,
-                    mip_count: env.mip_count,
-                    intensity: self.skybox.intensity(),
-                    rotation: self.skybox.rotation(),
-                }));
-            } else {
-                mat.set_environment_lighting(None);
-            }
+            let env = self.skybox.ibl_env();
+            let intensity = self.skybox.intensity();
+            let rotation = self.skybox.rotation();
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| match env {
+                    Some(env) => mat.set_environment_lighting(Some(crate::resource::EnvLight {
+                        view: &env.view,
+                        sampler: &env.sampler,
+                        mip_count: env.mip_count,
+                        intensity,
+                        rotation,
+                    })),
+                    None => mat.set_environment_lighting(None),
+                });
+            });
         }
 
         // Supply the reflection probes (parallax-corrected localized env maps) to
         // the default material, or clear them when none are registered.
         {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut mat = default_mat.borrow_mut();
-            match self.reflection_probes.as_ref() {
+            let mut supply = |mat: &mut (dyn crate::resource::Material3d + 'static)| match self
+                .reflection_probes
+                .as_ref()
+            {
                 Some(probes) if !probes.is_empty() => {
                     let records: Vec<crate::resource::ProbeData> = probes
                         .probes()
@@ -498,7 +501,8 @@ impl Window {
                     }));
                 }
                 _ => mat.set_reflection_probes(None),
-            }
+            };
+            MaterialManager3d::get_global_manager(|mm| mm.for_each(&mut supply));
         }
 
         // SSAO / SSR share the geometry G-buffer prepass. Ensure the prepass
@@ -524,13 +528,10 @@ impl Window {
             ssao.resize(w, h);
         }
         {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut mat = default_mat.borrow_mut();
-            if self.ssao_enabled {
-                mat.set_ssao(Some(self.ssao.as_ref().unwrap().ao_view()));
-            } else {
-                mat.set_ssao(None);
-            }
+            let ao = self
+                .ssao_enabled
+                .then(|| self.ssao.as_ref().unwrap().ao_view());
+            MaterialManager3d::get_global_manager(|mm| mm.for_each(|mat| mat.set_ssao(ao)));
         }
 
         // Create a light collection for this frame
@@ -552,9 +553,9 @@ impl Window {
                 self.probe_capture = Some(crate::renderer::ProbeCapture::new(FACE));
             }
             // Force the non-clustered shading path for the capture frame uniforms.
-            MaterialManager3d::get_global_manager(|mm| mm.get_default())
-                .borrow_mut()
-                .set_capture_mode(true);
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| mat.set_capture_mode(true));
+            });
 
             // Each cube face must be its own queue submission. The frame uniform
             // (and the object-uniform buffer) are shared and uploaded with
@@ -829,13 +830,11 @@ impl Window {
                 let lights_buf = clustered.lights_buffer().clone();
                 let grid_buf = clustered.grid_buffer().clone();
                 let index_buf = clustered.index_buffer().clone();
-                let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-                default_mat.borrow_mut().set_clustered_buffers(
-                    &lights_buf,
-                    &grid_buf,
-                    &index_buf,
-                    realloc,
-                );
+                MaterialManager3d::get_global_manager(|mm| {
+                    mm.for_each(|mat| {
+                        mat.set_clustered_buffers(&lights_buf, &grid_buf, &index_buf, realloc);
+                    });
+                });
             }
 
             // Phase 3: Render - issue draw calls using a SINGLE render pass.
@@ -1168,11 +1167,11 @@ impl Window {
                         // layers already drawn), then draw this layer sampling it.
                         t.build(&mut encoder, scene_resolved, &mut self.gpu_timer);
                         {
-                            let default_mat =
-                                MaterialManager3d::get_global_manager(|mm| mm.get_default());
-                            default_mat
-                                .borrow_mut()
-                                .set_transmission_background(Some(t.view()));
+                            MaterialManager3d::get_global_manager(|mm| {
+                                mm.for_each(|mat| {
+                                    mat.set_transmission_background(Some(t.view()));
+                                });
+                            });
                         }
                         let glass_ts = self.gpu_timer.render_scope("transmission");
                         let mut glass_pass =
@@ -1437,6 +1436,12 @@ impl Window {
             }
         }
 
+        // iOS's analogue of the requestAnimationFrame wait above: the app
+        // future is polled once per winit loop turn (see `window::ios`), so
+        // yielding here paces the render loop to one frame per turn.
+        #[cfg(target_os = "ios")]
+        super::ios::next_frame().await;
+
         if self.should_close() {
             RenderFrameStatus::Closed
         } else {
@@ -1474,7 +1479,10 @@ impl Window {
         } else {
             match self.acquire_next_frame() {
                 Some(frame) => Some(frame),
-                None => return !self.should_close(),
+                None => {
+                    self.discard_queued_draws();
+                    return !self.should_close();
+                }
             }
         };
 
@@ -1673,7 +1681,22 @@ impl Window {
             }
         }
 
+        // Same pacing as the rasterizer path: one frame per winit loop turn.
+        #[cfg(target_os = "ios")]
+        super::ios::next_frame().await;
+
         !self.should_close()
+    }
+
+    /// Drops the lines, points and text queued for a frame that is skipped.
+    /// Otherwise they pile up while no frame is drawn (e.g. a window on another macOS Space).
+    fn discard_queued_draws(&mut self) {
+        self.triangle_renderer.clear();
+        self.polyline_renderer.clear();
+        self.polyline_renderer_2d.clear();
+        self.point_renderer.clear();
+        self.point_renderer_2d.clear();
+        self.text_renderer.clear();
     }
 
     /// Acquires the surface texture for the next frame.
@@ -1697,10 +1720,13 @@ impl Window {
             return None;
         }
 
-        #[cfg(target_arch = "wasm32")]
+        // On wasm and iOS the loop belongs to the platform, so there is no
+        // pumping it from in here: skip the frame and let the next loop turn
+        // retry instead of sleeping inside a callback.
+        #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
         return None;
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
         {
             let deadline = std::time::Instant::now() + STARTUP_SURFACE_TIMEOUT;
             loop {
@@ -1850,15 +1876,15 @@ impl Window {
         // Fixed-light path for the capture frames (the mirror camera has no clustered
         // cull data). Reflector surfaces skip themselves during capture (handled in
         // the material via `capture_mode`).
-        MaterialManager3d::get_global_manager(|mm| mm.get_default())
-            .borrow_mut()
-            .set_capture_mode(true);
+        MaterialManager3d::get_global_manager(|mm| {
+            mm.for_each(|mat| mat.set_capture_mode(true));
+        });
 
         for (mut mcam, color_view, depth_view, clip) in jobs {
             // Clip geometry behind this mirror's plane.
-            MaterialManager3d::get_global_manager(|mm| mm.get_default())
-                .borrow_mut()
-                .set_clip_plane(Some(clip));
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| mat.set_clip_plane(Some(clip)));
+            });
 
             // Prepare + flush the scene for the mirror camera.
             MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
@@ -2016,10 +2042,9 @@ impl Window {
                 let t = self.transmission.as_ref().unwrap();
                 t.build(&mut menc, &color_view, &mut self.gpu_timer);
                 {
-                    let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-                    default_mat
-                        .borrow_mut()
-                        .set_transmission_background(Some(t.view()));
+                    MaterialManager3d::get_global_manager(|mm| {
+                        mm.for_each(|mat| mat.set_transmission_background(Some(t.view())));
+                    });
                 }
                 let glass_ctx = RenderContext {
                     surface_format: crate::post_processing::HDR_FORMAT,
@@ -2069,13 +2094,13 @@ impl Window {
             ctxt.submit(std::iter::once(menc.finish()));
         }
 
-        // Restore the default material's state.
-        {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut m = default_mat.borrow_mut();
-            m.set_capture_mode(false);
-            m.set_clip_plane(None);
-        }
+        // Restore every material's state.
+        MaterialManager3d::get_global_manager(|mm| {
+            mm.for_each(|mat| {
+                mat.set_capture_mode(false);
+                mat.set_clip_plane(None);
+            });
+        });
 
         // Bump the frame counter so the per-pass loop re-prepares the main camera
         // (reflector objects then pick up the view-proj set on their Reflector above).

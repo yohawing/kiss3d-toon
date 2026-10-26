@@ -267,7 +267,7 @@ impl GpuTimer {
                     .buffer
                     .slice(..)
                     .get_mapped_range()
-                    .expect("GPU timing readback mapping became invalid");
+                    .expect("timestamp buffer is mapped");
                 let ticks: &[u64] = bytemuck::cast_slice(&view);
                 let mut out: Vec<(&'static str, Duration)> = Vec::new();
                 for (i, &name) in slot.names.iter().enumerate() {

@@ -390,6 +390,34 @@ impl Window {
         self.canvas.set_cursor_grab(grab);
     }
 
+    /// Enters or leaves borderless fullscreen on the current monitor.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.canvas.set_fullscreen(fullscreen);
+    }
+
+    /// Shows or hides the platform's on-screen keyboard.
+    ///
+    /// # Platform-specific
+    /// Android and iOS summon the system keyboard; typed text then arrives as
+    /// ordinary `Char`/`Key` events. Desktop and web are no-ops.
+    pub fn set_keyboard_visible(&self, visible: bool) {
+        self.canvas.set_keyboard_visible(visible);
+    }
+
+    /// Whether the window is currently fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.canvas.is_fullscreen()
+    }
+
+    /// Files dropped onto the window since the last call, in drop order.
+    ///
+    /// # Platform-specific
+    /// Always empty on the web: browsers deliver file drops to the page, not
+    /// the canvas.
+    pub fn dropped_files(&self) -> Vec<std::path::PathBuf> {
+        self.canvas.take_dropped_files()
+    }
+
     /// Sets the cursor position in window coordinates.
     ///
     /// # Arguments
@@ -797,6 +825,19 @@ impl Window {
         self.shadow_mapper.resolution()
     }
 
+    /// Sets how many shadow atlas layers are allocated (`1..=MAX_SHADOW_VIEWS`,
+    /// default 16). A directional light needs one layer per cascade, a spot
+    /// light one, a point light six; lights that do not fit cast no shadow.
+    /// Fewer layers make a higher [`Self::set_shadow_resolution`] affordable.
+    pub fn set_shadow_atlas_layers(&mut self, layers: u32) {
+        self.shadow_mapper.set_atlas_layers(layers);
+    }
+
+    /// Returns the number of shadow atlas layers allocated.
+    pub fn shadow_atlas_layers(&self) -> u32 {
+        self.shadow_mapper.atlas_layers()
+    }
+
     /// Sets the rasterizer shadow-edge softness (PCF blur).
     ///
     /// `1.0` (the default) is the standard penumbra; larger values blur the
@@ -809,6 +850,32 @@ impl Window {
     /// Returns the current rasterizer shadow-edge softness (PCF blur).
     pub fn shadow_softness(&self) -> f32 {
         self.shadow_mapper.softness()
+    }
+
+    /// Caps how far from the camera directional shadows reach (world units along
+    /// the view; `INFINITY`, the default, uses the camera far plane). The
+    /// cascades are fit to the camera frustum up to this distance, so a tighter
+    /// cap spends the shadow atlas on nearer geometry.
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.shadow_mapper.set_shadow_distance(distance);
+    }
+
+    /// Returns the directional-shadow distance cap.
+    pub fn shadow_distance(&self) -> f32 {
+        self.shadow_mapper.shadow_distance()
+    }
+
+    /// Sets the far view distance of the highest-resolution directional cascade
+    /// (it covers `[near, bound]`; the default is 12). Lower it for crisper
+    /// shadows on a small scene close to the camera, raise it so crisp shadows
+    /// reach further away.
+    pub fn set_first_cascade_far_bound(&mut self, bound: f32) {
+        self.shadow_mapper.set_first_cascade_far_bound(bound);
+    }
+
+    /// Returns the far view distance of the highest-resolution directional cascade.
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.shadow_mapper.first_cascade_far_bound()
     }
 
     /// The current HDR finishing settings (exposure, tonemap operator, bloom).
@@ -1209,8 +1276,8 @@ impl Window {
         let (event_send, event_receive) = mpsc::channel();
         let canvas = Canvas::open_headless(width, height, setup, event_send).await;
         let (width, height) = canvas.size();
-        // A headless surface is never multisampled.
         let canvas_surface_format = canvas.surface_format();
+        let sample_count = canvas.sample_count();
 
         Context::increment_window_count();
         WindowCache::populate();
@@ -1239,8 +1306,7 @@ impl Window {
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
-            // Offscreen rendering is single-sampled (see `render_single_frame`).
-            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             ssao: None,
             ssao_enabled: false,
@@ -1283,15 +1349,19 @@ impl Drop for Window {
         let is_last_window = Context::decrement_window_count();
 
         if is_last_window {
-            // The order matters: clear caches first (which hold references to GPU resources),
-            // then clear the Context (which holds the wgpu Device/Queue/Instance).
+            // The order matters: the 2D managers are lazily initialized and their default
+            // material reaches into WindowCache's texture manager during construction. Keep
+            // WindowCache alive until both managers have been reset, then release the 3D
+            // cache and finally the Context (which owns the wgpu Device/Queue/Instance).
 
-            // Clear 3D resource managers
-            WindowCache::reset();
-
-            // Clear 2D resource managers
+            // Clear standalone GPU globals and 2D resource managers while their
+            // WindowCache dependencies are available.
+            crate::builtin::deform::reset_globals();
             MeshManager2d::reset_global_manager();
             MaterialManager2d::reset_global_manager();
+
+            // Clear 3D resource managers.
+            WindowCache::reset();
 
             // Finally, clear the wgpu context itself
             Context::reset();

@@ -23,8 +23,9 @@ use glamx::{Mat4, Pose3, Quat, Vec2, Vec3};
 use image::{DynamicImage, ImageFormat, ImageReader};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
-use std::io::{Cursor, Error as IoError, ErrorKind};
+use std::convert::{TryFrom, TryInto};
+use std::fs::File;
+use std::io::{Cursor, Error as IoError, ErrorKind, Read};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::rc::Rc;
@@ -33,6 +34,73 @@ use std::sync::Arc;
 const MAX_GLTF_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_GLTF_IMAGE_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GLTF_DECODED_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Limits applied before parsing a CPU glTF decode source.
+///
+/// The struct is deliberately non-exhaustive so additional source, document,
+/// or CPU-template budgets can be added without breaking callers.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GltfDecodeLimits {
+    /// Maximum source size accepted by either path or in-memory decode.
+    pub max_source_bytes: u64,
+    /// Maximum JSON document or GLB JSON chunk size.
+    pub max_json_bytes: u64,
+    /// Maximum aggregate declared byte length across all glTF buffers.
+    pub max_declared_buffer_bytes: u64,
+    /// Maximum number of images in the parsed document.
+    pub max_images: u64,
+    /// Maximum aggregate element count across all accessors.
+    pub max_accessor_elements: u64,
+    /// Maximum aggregate decoded accessor byte size.
+    pub max_accessor_bytes: u64,
+    /// Maximum aggregate bytes read from external buffer and image URIs.
+    pub max_external_resource_bytes: u64,
+    /// Maximum number of nodes materialized in the CPU template.
+    pub max_nodes: u64,
+    /// Maximum number of skins materialized in the CPU template.
+    pub max_skins: u64,
+    /// Maximum aggregate skin joint references materialized in the CPU template.
+    /// This counts each `CpuSkin` definition's joints, rather than deduplicating
+    /// the runtime skeleton nodes.
+    pub max_skin_joint_references: u64,
+    /// Maximum number of meshes materialized in the CPU template.
+    pub max_meshes: u64,
+    /// Maximum aggregate mesh primitives materialized in the CPU template.
+    pub max_primitives: u64,
+    /// Maximum number of materials materialized in the CPU template.
+    pub max_materials: u64,
+    /// Maximum number of animation clips materialized in the CPU template.
+    pub max_animations: u64,
+    /// Maximum aggregate animation channels materialized in the CPU template.
+    pub max_animation_channels: u64,
+    /// Maximum aggregate animation input values and, independently, output
+    /// values materialized in the CPU template.
+    pub max_animation_key_values: u64,
+}
+
+impl Default for GltfDecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: 1024 * 1024 * 1024,
+            max_json_bytes: 64 * 1024 * 1024,
+            max_declared_buffer_bytes: 1024 * 1024 * 1024,
+            max_images: 256,
+            max_accessor_elements: 100_000_000,
+            max_accessor_bytes: 1024 * 1024 * 1024,
+            max_external_resource_bytes: 1024 * 1024 * 1024,
+            max_nodes: 262_144,
+            max_skins: 65_536,
+            max_skin_joint_references: 262_144,
+            max_meshes: 262_144,
+            max_primitives: 262_144,
+            max_materials: 262_144,
+            max_animations: 64,
+            max_animation_channels: 65_536,
+            max_animation_key_values: 1_000_000,
+        }
+    }
+}
 
 /// Validates the number of animation output elements for one glTF channel.
 /// Vector and quaternion channels use one element per key; morph channels use
@@ -106,6 +174,54 @@ fn decoded_image_budget_error() -> gltf::Error {
     ))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EncodedResourceBudget {
+    total_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl EncodedResourceBudget {
+    fn new(max_total_bytes: u64) -> Self {
+        Self {
+            total_bytes: 0,
+            max_total_bytes,
+        }
+    }
+
+    fn remaining(&self) -> u64 {
+        self.max_total_bytes.saturating_sub(self.total_bytes)
+    }
+
+    fn ensure_bound(&self, bytes: u64) -> Result<(), gltf::Error> {
+        let next = self
+            .total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| encoded_resource_budget_error(u64::MAX, self.max_total_bytes))?;
+        if next > self.max_total_bytes {
+            return Err(encoded_resource_budget_error(next, self.max_total_bytes));
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<(), gltf::Error> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| encoded_resource_budget_error(u64::MAX, self.max_total_bytes))?;
+        self.ensure_bound(bytes)?;
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| encoded_resource_budget_error(u64::MAX, self.max_total_bytes))?;
+        Ok(())
+    }
+}
+
+fn encoded_resource_budget_error(actual: u64, limit: u64) -> gltf::Error {
+    gltf::Error::Io(IoError::new(
+        ErrorKind::InvalidData,
+        format!("glTF external encoded resource bytes total is {actual}; limit is {limit}"),
+    ))
+}
+
 /// One renderable primitive of a glTF mesh: a shareable GPU mesh plus the index
 /// of the material that shades it.
 struct PrimInfo {
@@ -165,6 +281,10 @@ struct CpuMaterial {
     roughness: f32,
     emissive: [f32; 3],
     extensions: MaterialExtensionFactors,
+    /// Runtime alpha mode, including the normalized MASK cutoff when applicable.
+    alpha_mode: AlphaMode,
+    /// The effective MASK cutoff; other alpha modes ignore this glTF property.
+    alpha_cutoff: Option<f32>,
     base_color_image: Option<usize>,
     metallic_roughness_image: Option<usize>,
     normal_image: Option<usize>,
@@ -277,15 +397,33 @@ pub fn load_from_slice(bytes: &[u8]) -> Result<GltfModel, gltf::Error> {
 /// for a future worker-thread decode path.
 /// Image dimensions and aggregate decoded image bytes are bounded before the
 /// decoded images are retained in the template.
-/// This API does not enforce the renderer's aggregate source/buffer budget;
-/// callers handling untrusted files must run their source preflight first.
+/// The default source and JSON limits match the renderer's current parser
+/// preflight. External buffer and image URI reads share the configured
+/// `max_external_resource_bytes` budget.
 pub fn decode_cpu(path: &Path) -> Result<GltfAssetTemplate, gltf::Error> {
-    let gltf = gltf::Gltf::open(path)?;
+    decode_cpu_with_limits(path, &GltfDecodeLimits::default())
+}
+
+/// Decodes a glTF/GLB into an owned CPU template with explicit source limits.
+pub fn decode_cpu_with_limits(
+    path: &Path,
+    limits: &GltfDecodeLimits,
+) -> Result<GltfAssetTemplate, gltf::Error> {
+    let source = read_path_source_with_limits(path, limits)?;
+    validate_slice_source_limits(&source, limits)?;
+    let gltf = gltf::Gltf::from_slice(&source)?;
+    validate_document_decode_limits(&gltf.document, limits)?;
     let base = path.parent().unwrap_or_else(|| Path::new("./"));
     let gltf::Gltf { document, blob } = gltf;
-    let buffers = gltf::import_buffers(&document, Some(base), blob)?;
+    let mut resource_budget = EncodedResourceBudget::new(limits.max_external_resource_bytes);
+    let buffers = import_buffers_with_budget(&document, Some(base), blob, &mut resource_budget)?;
     catch_unwind(AssertUnwindSafe(|| {
-        let images = import_images_with_budget(&document, Some(base), &buffers)?;
+        let images = import_images_with_encoded_budget(
+            &document,
+            Some(base),
+            &buffers,
+            &mut resource_budget,
+        )?;
         decode_cpu_internal(document, buffers, images)
     }))
     .map_err(|_| loader_panic_error())?
@@ -294,14 +432,28 @@ pub fn decode_cpu(path: &Path) -> Result<GltfAssetTemplate, gltf::Error> {
 /// Decodes an in-memory glTF/GLB into an owned CPU template without GPU work.
 /// The returned template is opaque until a future CPU-to-GPU instantiate API is
 /// added; malformed input is reported as [`gltf::Error`]. Image dimensions and
-/// aggregate decoded image bytes are bounded, but the renderer's aggregate
-/// source/buffer budget is not enforced by this standalone API.
+/// aggregate decoded image bytes are bounded, and the default source/JSON
+/// and document limits match the renderer's current parser preflight.
+/// External buffer and image URI reads share the configured
+/// `max_external_resource_bytes` budget.
 pub fn decode_cpu_from_slice(bytes: &[u8]) -> Result<GltfAssetTemplate, gltf::Error> {
+    decode_cpu_from_slice_with_limits(bytes, &GltfDecodeLimits::default())
+}
+
+/// Decodes an in-memory glTF/GLB into an owned CPU template with explicit source limits.
+pub fn decode_cpu_from_slice_with_limits(
+    bytes: &[u8],
+    limits: &GltfDecodeLimits,
+) -> Result<GltfAssetTemplate, gltf::Error> {
+    validate_slice_source_limits(bytes, limits)?;
     let gltf = gltf::Gltf::from_slice(bytes)?;
+    validate_document_decode_limits(&gltf.document, limits)?;
     let gltf::Gltf { document, blob } = gltf;
-    let buffers = gltf::import_buffers(&document, None, blob)?;
+    let mut resource_budget = EncodedResourceBudget::new(limits.max_external_resource_bytes);
+    let buffers = import_buffers_with_budget(&document, None, blob, &mut resource_budget)?;
     catch_unwind(AssertUnwindSafe(|| {
-        let images = import_images_with_budget(&document, None, &buffers)?;
+        let images =
+            import_images_with_encoded_budget(&document, None, &buffers, &mut resource_budget)?;
         decode_cpu_internal(document, buffers, images)
     }))
     .map_err(|_| loader_panic_error())?
@@ -314,6 +466,604 @@ fn loader_panic_error() -> gltf::Error {
     ))
 }
 
+fn invalid_decode_source_error(message: impl Into<String>) -> gltf::Error {
+    gltf::Error::Io(IoError::new(ErrorKind::InvalidData, message.into()))
+}
+
+fn read_path_source_with_limits(
+    path: &Path,
+    limits: &GltfDecodeLimits,
+) -> Result<Vec<u8>, gltf::Error> {
+    let file = File::open(path).map_err(gltf::Error::Io)?;
+    let read_limit = limits
+        .max_source_bytes
+        .checked_add(1)
+        .ok_or_else(|| invalid_decode_source_error("glTF source limit overflowed"))?;
+    let mut source = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut source)
+        .map_err(gltf::Error::Io)?;
+    let source_bytes = u64::try_from(source.len())
+        .map_err(|_| invalid_decode_source_error("glTF source length does not fit u64"))?;
+    validate_source_byte_limit(source_bytes, limits)?;
+    Ok(source)
+}
+
+fn validate_slice_source_limits(
+    bytes: &[u8],
+    limits: &GltfDecodeLimits,
+) -> Result<(), gltf::Error> {
+    let source_bytes = u64::try_from(bytes.len())
+        .map_err(|_| invalid_decode_source_error("glTF source length does not fit u64"))?;
+    validate_source_byte_limit(source_bytes, limits)?;
+
+    if bytes.len() >= 4 && bytes[..4] == *b"glTF" {
+        if bytes.len() < 12 {
+            return Err(invalid_decode_source_error("glTF GLB header is truncated"));
+        }
+        let header_tail: [u8; 8] = bytes[4..12].try_into().unwrap();
+        let declared_length = validate_glb_header_limits(source_bytes, &header_tail, limits)?;
+        if bytes.len() < 20 {
+            return Err(invalid_decode_source_error(
+                "glTF GLB JSON chunk header is truncated",
+            ));
+        }
+        let chunk_header: [u8; 8] = bytes[12..20].try_into().unwrap();
+        validate_glb_json_chunk_limits(declared_length, &chunk_header, limits)?;
+    } else {
+        validate_json_byte_limit(source_bytes, limits)?;
+    }
+    Ok(())
+}
+
+fn validate_document_decode_limits(
+    document: &gltf::Document,
+    limits: &GltfDecodeLimits,
+) -> Result<(), gltf::Error> {
+    let mut declared_buffer_bytes = 0u64;
+    for buffer in document.buffers() {
+        let length = u64::try_from(buffer.length()).map_err(|_| {
+            invalid_document_limit_overflow(
+                "declared buffer bytes",
+                limits.max_declared_buffer_bytes,
+            )
+        })?;
+        declared_buffer_bytes = declared_buffer_bytes.checked_add(length).ok_or_else(|| {
+            invalid_document_limit_overflow(
+                "declared buffer bytes",
+                limits.max_declared_buffer_bytes,
+            )
+        })?;
+    }
+    if declared_buffer_bytes > limits.max_declared_buffer_bytes {
+        return Err(invalid_document_limit_error(
+            "declared buffer bytes",
+            declared_buffer_bytes,
+            limits.max_declared_buffer_bytes,
+        ));
+    }
+
+    let image_count = u64::try_from(document.images().count())
+        .map_err(|_| invalid_document_limit_overflow("image count", limits.max_images))?;
+    if image_count > limits.max_images {
+        return Err(invalid_document_limit_error(
+            "image count",
+            image_count,
+            limits.max_images,
+        ));
+    }
+
+    let mut accessor_elements = 0u64;
+    let mut accessor_bytes = 0u64;
+    for accessor in document.accessors() {
+        let elements = u64::try_from(accessor.count()).map_err(|_| {
+            invalid_document_limit_overflow("accessor elements", limits.max_accessor_elements)
+        })?;
+        let bytes_per_element = u64::try_from(accessor.size()).map_err(|_| {
+            invalid_document_limit_overflow("accessor bytes", limits.max_accessor_bytes)
+        })?;
+        let bytes = elements.checked_mul(bytes_per_element).ok_or_else(|| {
+            invalid_document_limit_overflow("accessor bytes", limits.max_accessor_bytes)
+        })?;
+        accessor_elements = accessor_elements.checked_add(elements).ok_or_else(|| {
+            invalid_document_limit_overflow("accessor elements", limits.max_accessor_elements)
+        })?;
+        accessor_bytes = accessor_bytes.checked_add(bytes).ok_or_else(|| {
+            invalid_document_limit_overflow("accessor bytes", limits.max_accessor_bytes)
+        })?;
+    }
+    if accessor_elements > limits.max_accessor_elements {
+        return Err(invalid_document_limit_error(
+            "accessor elements",
+            accessor_elements,
+            limits.max_accessor_elements,
+        ));
+    }
+    if accessor_bytes > limits.max_accessor_bytes {
+        return Err(invalid_document_limit_error(
+            "accessor bytes",
+            accessor_bytes,
+            limits.max_accessor_bytes,
+        ));
+    }
+    validate_document_collection_limits(document, limits)
+}
+
+fn validate_document_collection_limits(
+    document: &gltf::Document,
+    limits: &GltfDecodeLimits,
+) -> Result<(), gltf::Error> {
+    validate_document_count("node count", document.nodes().count(), limits.max_nodes)?;
+    validate_document_count("skin count", document.skins().count(), limits.max_skins)?;
+    validate_document_count("mesh count", document.meshes().count(), limits.max_meshes)?;
+    validate_document_count(
+        "material count",
+        document.materials().count(),
+        limits.max_materials,
+    )?;
+    validate_document_count(
+        "animation count",
+        document.animations().count(),
+        limits.max_animations,
+    )?;
+
+    let mut skin_joint_references = 0u64;
+    let node_count = document.as_json().nodes.len();
+    for (skin_index, raw_skin) in document.as_json().skins.iter().enumerate() {
+        for (joint_index, joint) in raw_skin.joints.iter().enumerate() {
+            if joint.value() >= node_count {
+                return Err(invalid_decode_source_error(format!(
+                    "glTF skin {skin_index} joint {joint_index} references node {}; node count is {node_count}",
+                    joint.value()
+                )));
+            }
+        }
+    }
+    for skin in document.skins() {
+        let joints = u64::try_from(skin.joints().count()).map_err(|_| {
+            invalid_document_limit_overflow(
+                "skin joint references",
+                limits.max_skin_joint_references,
+            )
+        })?;
+        skin_joint_references = skin_joint_references.checked_add(joints).ok_or_else(|| {
+            invalid_document_limit_overflow(
+                "skin joint references",
+                limits.max_skin_joint_references,
+            )
+        })?;
+    }
+    if skin_joint_references > limits.max_skin_joint_references {
+        return Err(invalid_document_limit_error(
+            "skin joint references",
+            skin_joint_references,
+            limits.max_skin_joint_references,
+        ));
+    }
+
+    let mut primitive_count = 0u64;
+    for mesh in document.meshes() {
+        let primitives = u64::try_from(mesh.primitives().count()).map_err(|_| {
+            invalid_document_limit_overflow("primitive count", limits.max_primitives)
+        })?;
+        primitive_count = primitive_count.checked_add(primitives).ok_or_else(|| {
+            invalid_document_limit_overflow("primitive count", limits.max_primitives)
+        })?;
+    }
+    if primitive_count > limits.max_primitives {
+        return Err(invalid_document_limit_error(
+            "primitive count",
+            primitive_count,
+            limits.max_primitives,
+        ));
+    }
+
+    let mut channel_count = 0u64;
+    let mut input_values = 0u64;
+    let mut output_values = 0u64;
+    for animation in document.animations() {
+        for (channel_index, channel) in animation.channels().enumerate() {
+            channel_count = channel_count.checked_add(1).ok_or_else(|| {
+                invalid_document_limit_overflow(
+                    "animation channel count",
+                    limits.max_animation_channels,
+                )
+            })?;
+            if channel_count > limits.max_animation_channels {
+                return Err(invalid_document_limit_error(
+                    "animation channel count",
+                    channel_count,
+                    limits.max_animation_channels,
+                ));
+            }
+            let channel_result = catch_unwind(AssertUnwindSafe(|| {
+                validate_document_animation_channel(document, &animation, &channel, channel_index)
+            }));
+            let (channel_inputs, channel_outputs) = match channel_result {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(invalid_decode_source_error(format!(
+                        "glTF animation {} channel {channel_index} has an invalid sampler or accessor/target/node reference",
+                        animation.index()
+                    )))
+                }
+            };
+            input_values = input_values.checked_add(channel_inputs).ok_or_else(|| {
+                invalid_document_limit_overflow(
+                    "animation input key values",
+                    limits.max_animation_key_values,
+                )
+            })?;
+            if input_values > limits.max_animation_key_values {
+                return Err(invalid_document_limit_error(
+                    "animation input key values",
+                    input_values,
+                    limits.max_animation_key_values,
+                ));
+            }
+            output_values = output_values.checked_add(channel_outputs).ok_or_else(|| {
+                invalid_document_limit_overflow(
+                    "animation output key values",
+                    limits.max_animation_key_values,
+                )
+            })?;
+            if output_values > limits.max_animation_key_values {
+                return Err(invalid_document_limit_error(
+                    "animation output key values",
+                    output_values,
+                    limits.max_animation_key_values,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_document_count(field: &str, count: usize, limit: u64) -> Result<u64, gltf::Error> {
+    let actual = u64::try_from(count).map_err(|_| invalid_document_limit_overflow(field, limit))?;
+    if actual > limit {
+        return Err(invalid_document_limit_error(field, actual, limit));
+    }
+    Ok(actual)
+}
+
+fn validate_document_animation_channel(
+    document: &gltf::Document,
+    animation: &gltf::Animation<'_>,
+    channel: &gltf::animation::Channel<'_>,
+    channel_index: usize,
+) -> Result<(u64, u64), gltf::Error> {
+    let raw_animation = document
+        .as_json()
+        .animations
+        .get(animation.index())
+        .ok_or_else(|| {
+            invalid_decode_source_error(format!(
+                "glTF animation {} has an invalid document index",
+                animation.index()
+            ))
+        })?;
+    let raw_channel = raw_animation.channels.get(channel_index).ok_or_else(|| {
+        invalid_decode_source_error(format!(
+            "glTF animation {} channel {channel_index} has an invalid document index",
+            animation.index()
+        ))
+    })?;
+    let sampler_index = raw_channel.sampler.value();
+    let raw_sampler = raw_animation.samplers.get(sampler_index).ok_or_else(|| {
+        invalid_decode_source_error(format!(
+            "glTF animation {} channel {channel_index} has an invalid sampler reference",
+            animation.index()
+        ))
+    })?;
+    if raw_sampler.input.value() >= document.as_json().accessors.len()
+        || raw_sampler.output.value() >= document.as_json().accessors.len()
+    {
+        return Err(invalid_decode_source_error(format!(
+            "glTF animation {} channel {channel_index} has an invalid accessor reference",
+            animation.index()
+        )));
+    }
+    if raw_channel.target.node.value() >= document.as_json().nodes.len() {
+        return Err(invalid_decode_source_error(format!(
+            "glTF animation {} channel {channel_index} has an invalid target node reference",
+            animation.index()
+        )));
+    }
+    let sampler = channel.sampler();
+    let input_count = sampler.input().count();
+    let output_count = sampler.output().count();
+    let target = channel.target();
+    let components_per_key = match target.property() {
+        gltf::animation::Property::Translation
+        | gltf::animation::Property::Rotation
+        | gltf::animation::Property::Scale => 1,
+        gltf::animation::Property::MorphTargetWeights => target
+            .node()
+            .mesh()
+            .and_then(|mesh| {
+                mesh.primitives()
+                    .map(|primitive| primitive.morph_targets().len())
+                    .max()
+            })
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                invalid_decode_source_error(format!(
+                    "glTF animation {} channel {channel_index} targets a node without morph targets",
+                    animation.index()
+                ))
+            })?,
+    };
+    validate_animation_output_cardinality(
+        input_count,
+        matches!(
+            sampler.interpolation(),
+            gltf::animation::Interpolation::CubicSpline
+        ),
+        output_count,
+        components_per_key,
+    )
+    .map_err(|error| {
+        invalid_decode_source_error(format!(
+            "glTF animation {} channel {channel_index} has invalid output cardinality: {error}",
+            animation.index()
+        ))
+    })?;
+    Ok((
+        u64::try_from(input_count)
+            .map_err(|_| invalid_document_limit_overflow("animation input key values", u64::MAX))?,
+        u64::try_from(output_count).map_err(|_| {
+            invalid_document_limit_overflow("animation output key values", u64::MAX)
+        })?,
+    ))
+}
+
+fn invalid_document_limit_error(field: &str, actual: u64, limit: u64) -> gltf::Error {
+    invalid_decode_source_error(format!("glTF {field} is {actual}; limit is {limit}"))
+}
+
+fn invalid_document_limit_overflow(field: &str, limit: u64) -> gltf::Error {
+    invalid_decode_source_error(format!(
+        "glTF {field} aggregate overflowed before a representable actual value; limit is {limit}"
+    ))
+}
+
+fn validate_source_byte_limit(
+    source_bytes: u64,
+    limits: &GltfDecodeLimits,
+) -> Result<(), gltf::Error> {
+    if source_bytes > limits.max_source_bytes {
+        return Err(invalid_decode_source_error(format!(
+            "glTF source is {source_bytes} bytes; limit is {} bytes",
+            limits.max_source_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn validate_json_byte_limit(json_bytes: u64, limits: &GltfDecodeLimits) -> Result<(), gltf::Error> {
+    if json_bytes > limits.max_json_bytes {
+        return Err(invalid_decode_source_error(format!(
+            "glTF JSON document is {json_bytes} bytes; limit is {} bytes",
+            limits.max_json_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn validate_glb_header_limits(
+    source_bytes: u64,
+    header_tail: &[u8; 8],
+    limits: &GltfDecodeLimits,
+) -> Result<u64, gltf::Error> {
+    let version = u32::from_le_bytes(header_tail[..4].try_into().unwrap());
+    if version != 2 {
+        return Err(invalid_decode_source_error(
+            "glTF GLB source requires version 2",
+        ));
+    }
+    let declared_length = u64::from(u32::from_le_bytes(header_tail[4..].try_into().unwrap()));
+    if declared_length > limits.max_source_bytes {
+        return Err(invalid_decode_source_error(format!(
+            "glTF GLB declares {declared_length} bytes; limit is {} bytes",
+            limits.max_source_bytes
+        )));
+    }
+    if declared_length != source_bytes {
+        return Err(invalid_decode_source_error(format!(
+            "glTF GLB declares {declared_length} bytes but source has {source_bytes} bytes"
+        )));
+    }
+    Ok(declared_length)
+}
+
+fn validate_glb_json_chunk_limits(
+    declared_length: u64,
+    chunk_header: &[u8; 8],
+    limits: &GltfDecodeLimits,
+) -> Result<(), gltf::Error> {
+    if &chunk_header[4..] != b"JSON" {
+        return Err(invalid_decode_source_error(
+            "glTF GLB source requires a JSON first chunk",
+        ));
+    }
+    let json_length = u64::from(u32::from_le_bytes(chunk_header[..4].try_into().unwrap()));
+    if json_length > limits.max_json_bytes {
+        return Err(invalid_decode_source_error(format!(
+            "glTF GLB JSON chunk is {json_length} bytes; limit is {} bytes",
+            limits.max_json_bytes
+        )));
+    }
+    let json_end = 20u64
+        .checked_add(json_length)
+        .ok_or_else(|| invalid_decode_source_error("glTF GLB JSON chunk length overflowed"))?;
+    if json_end > declared_length {
+        return Err(invalid_decode_source_error(format!(
+            "glTF GLB JSON chunk ends at {json_end} bytes beyond declared source length {declared_length}"
+        )));
+    }
+    Ok(())
+}
+
+fn import_buffers_with_budget(
+    document: &gltf::Document,
+    base: Option<&Path>,
+    mut blob: Option<Vec<u8>>,
+    resource_budget: &mut EncodedResourceBudget,
+) -> Result<Vec<gltf::buffer::Data>, gltf::Error> {
+    let mut buffers = Vec::new();
+    for buffer in document.buffers() {
+        let mut data = match buffer.source() {
+            gltf::buffer::Source::Uri(uri) => read_external_uri(uri, base, resource_budget)?,
+            gltf::buffer::Source::Bin => blob.take().ok_or(gltf::Error::MissingBlob)?,
+        };
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        if data.len() < buffer.length() {
+            return Err(gltf::Error::BufferLength {
+                buffer: buffer.index(),
+                expected: buffer.length(),
+                actual: data.len(),
+            });
+        }
+        buffers.push(gltf::buffer::Data(data));
+    }
+    Ok(buffers)
+}
+
+fn read_external_uri(
+    uri: &str,
+    base: Option<&Path>,
+    resource_budget: &mut EncodedResourceBudget,
+) -> Result<Vec<u8>, gltf::Error> {
+    if let Some(rest) = uri.strip_prefix("data:") {
+        let mut parts = rest.split(";base64,");
+        let payload = match (parts.next(), parts.next()) {
+            (_, Some(payload)) => payload,
+            (Some(payload), None) => payload,
+            _ => return Err(gltf::Error::UnsupportedScheme),
+        };
+        return read_data_uri(payload, resource_budget);
+    }
+
+    if let Some(path) = uri.strip_prefix("file://") {
+        if base.is_none() {
+            return Err(gltf::Error::ExternalReferenceInSliceImport);
+        }
+        return read_bounded_file(Path::new(path), resource_budget);
+    }
+    if let Some(path) = uri.strip_prefix("file:") {
+        if base.is_none() {
+            return Err(gltf::Error::ExternalReferenceInSliceImport);
+        }
+        return read_bounded_file(Path::new(path), resource_budget);
+    }
+    if uri.contains(':') {
+        return Err(gltf::Error::UnsupportedScheme);
+    }
+
+    let path = urlencoding::decode(uri).map_err(|error| {
+        invalid_decode_source_error(format!("glTF URI decoding failed: {error}"))
+    })?;
+    let base = base.ok_or(gltf::Error::ExternalReferenceInSliceImport)?;
+    read_bounded_file(&base.join(path.as_ref()), resource_budget)
+}
+
+fn read_bounded_file(
+    path: &Path,
+    resource_budget: &mut EncodedResourceBudget,
+) -> Result<Vec<u8>, gltf::Error> {
+    let file = File::open(path).map_err(gltf::Error::Io)?;
+    let read_limit = resource_budget.remaining().saturating_add(1);
+    let mut data = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut data)
+        .map_err(gltf::Error::Io)?;
+    resource_budget.reserve(data.len())?;
+    Ok(data)
+}
+
+fn read_data_uri(
+    payload: &str,
+    resource_budget: &mut EncodedResourceBudget,
+) -> Result<Vec<u8>, gltf::Error> {
+    let estimated_decoded_bytes = base64_decoded_length_bound(payload)?;
+    resource_budget.ensure_bound(estimated_decoded_bytes)?;
+    let decoded = base64::decode(payload).map_err(gltf::Error::Base64)?;
+    resource_budget.reserve(decoded.len())?;
+    Ok(decoded)
+}
+
+fn base64_decoded_length_bound(payload: &str) -> Result<u64, gltf::Error> {
+    let bytes = payload.as_bytes();
+    let payload_bytes = u64::try_from(bytes.len())
+        .map_err(|_| invalid_decode_source_error("glTF data URI length does not fit u64"))?;
+    let remainder = bytes.len() % 4;
+    if remainder == 1 {
+        return Err(gltf::Error::Base64(base64::DecodeError::InvalidLength));
+    }
+
+    let mut padding = 0usize;
+    for (index, byte) in bytes.iter().enumerate().rev() {
+        if *byte != b'=' {
+            break;
+        }
+        padding += 1;
+        if padding > 2 {
+            return Err(gltf::Error::Base64(base64::DecodeError::InvalidByte(
+                index, *byte,
+            )));
+        }
+    }
+    if padding > 0 && remainder != 0 {
+        return Err(gltf::Error::Base64(base64::DecodeError::InvalidByte(
+            bytes.len() - padding,
+            b'=',
+        )));
+    }
+
+    let content_len = bytes.len().saturating_sub(padding);
+    for (index, byte) in bytes[..content_len].iter().copied().enumerate() {
+        if !byte.is_ascii_alphanumeric() && byte != b'+' && byte != b'/' {
+            return Err(gltf::Error::Base64(base64::DecodeError::InvalidByte(
+                index, byte,
+            )));
+        }
+    }
+    if bytes[..content_len].contains(&b'=') {
+        let index = bytes[..content_len]
+            .iter()
+            .position(|byte| *byte == b'=')
+            .unwrap();
+        return Err(gltf::Error::Base64(base64::DecodeError::InvalidByte(
+            index, b'=',
+        )));
+    }
+
+    let groups = payload_bytes / 4;
+    let full_group_bytes = groups
+        .checked_mul(3)
+        .ok_or_else(|| invalid_decode_source_error("glTF data URI decoded length overflowed"))?;
+    if padding > 0 {
+        return full_group_bytes
+            .checked_sub(u64::try_from(padding).unwrap())
+            .ok_or_else(|| {
+                invalid_decode_source_error("glTF data URI decoded length underflowed")
+            });
+    }
+    let tail_bytes = match remainder {
+        0 => 0,
+        2 => 1,
+        3 => 2,
+        _ => unreachable!(),
+    };
+    full_group_bytes
+        .checked_add(tail_bytes)
+        .ok_or_else(|| invalid_decode_source_error("glTF data URI decoded length overflowed"))
+}
+
 fn import_images_with_budget(
     document: &gltf::Document,
     base: Option<&Path>,
@@ -322,8 +1072,28 @@ fn import_images_with_budget(
     let mut budget = DecodedImageBudget::default();
     document
         .images()
-        .map(|image| decode_image_source(image.source(), base, buffers, &mut budget))
+        .map(|image| decode_image_source(image.source(), base, buffers, &mut budget, None))
         .collect()
+}
+
+fn import_images_with_encoded_budget(
+    document: &gltf::Document,
+    base: Option<&Path>,
+    buffers: &[gltf::buffer::Data],
+    resource_budget: &mut EncodedResourceBudget,
+) -> Result<Vec<DynamicImage>, gltf::Error> {
+    let mut budget = DecodedImageBudget::default();
+    let mut images = Vec::new();
+    for image in document.images() {
+        images.push(decode_image_source(
+            image.source(),
+            base,
+            buffers,
+            &mut budget,
+            Some(resource_budget),
+        )?);
+    }
+    Ok(images)
 }
 
 fn decode_image_source(
@@ -331,6 +1101,7 @@ fn decode_image_source(
     base: Option<&Path>,
     buffers: &[gltf::buffer::Data],
     budget: &mut DecodedImageBudget,
+    resource_budget: Option<&mut EncodedResourceBudget>,
 ) -> Result<DynamicImage, gltf::Error> {
     let (encoded, uri, mime_type) = match source {
         gltf::image::Source::View { view, mime_type } => {
@@ -356,8 +1127,11 @@ fn decode_image_source(
             (encoded.to_vec(), None, Some(mime_type))
         }
         gltf::image::Source::Uri { uri, mime_type } => {
-            let encoded = gltf::buffer::Data::from_source(gltf::buffer::Source::Uri(uri), base)?;
-            (encoded.0, Some(uri), mime_type)
+            let encoded = match resource_budget {
+                Some(resource_budget) => read_external_uri(uri, base, resource_budget)?,
+                None => gltf::buffer::Data::from_source(gltf::buffer::Source::Uri(uri), base)?.0,
+            };
+            (encoded, Some(uri), mime_type)
         }
     };
     let format = image_format(uri, mime_type)?;
@@ -785,6 +1559,11 @@ fn decode_cpu_internal(
         .map(|material| {
             let pbr = material.pbr_metallic_roughness();
             let factors = material_factors(&material);
+            let alpha_mode = gltf_alpha_mode_or_default(Some(&material));
+            let alpha_cutoff = match alpha_mode {
+                AlphaMode::Mask(cutoff) => Some(cutoff),
+                AlphaMode::Opaque | AlphaMode::Blend | AlphaMode::Premultiplied => None,
+            };
             let base_color_texture = pbr
                 .base_color_texture()
                 .map(|info| info.texture().source().index());
@@ -806,6 +1585,8 @@ fn decode_cpu_internal(
                 roughness: factors.roughness,
                 emissive: factors.emissive,
                 extensions: factors.extensions,
+                alpha_mode,
+                alpha_cutoff,
                 base_color_image: base_color_texture,
                 metallic_roughness_image: metallic_roughness_texture,
                 normal_image: normal_texture,
@@ -1277,6 +2058,20 @@ fn validate_cpu_template(template: &GltfAssetTemplate) -> Result<(), gltf::Error
     for material in &template.materials {
         if !material_values_are_finite(material) {
             return Err(invalid_cpu_template("glTF material factors must be finite"));
+        }
+        if let AlphaMode::Mask(cutoff) = material.alpha_mode {
+            if !cutoff.is_finite()
+                || material.alpha_cutoff != Some(cutoff)
+                || material.alpha_cutoff.is_none_or(|value| !value.is_finite())
+            {
+                return Err(invalid_cpu_template(
+                    "glTF material alpha cutoff must be finite and consistent",
+                ));
+            }
+        } else if material.alpha_cutoff.is_some() {
+            return Err(invalid_cpu_template(
+                "glTF material alpha cutoff is only valid for MASK mode",
+            ));
         }
         let image_indices = [
             material.base_color_image,
@@ -1889,20 +2684,24 @@ fn morph_target_count(node: &gltf::Node<'_>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_cpu_from_slice, decode_image_bytes, extract_static_template,
-        finite_material_product_or, gltf_alpha_mode, gltf_alpha_mode_or_default, image_format,
-        import_images_with_budget, joint_edges, load_from_slice, material_extension_factors,
-        triangle_faces_from_indices, validate_animation_output_cardinality,
-        validate_animation_quat, validate_animation_times, validate_animation_vec3,
-        validate_cpu_template, validate_material_texture_sources, validate_parent_graph,
-        CpuAnimationOutput, CpuImage, CpuMaterial, CpuMesh, CpuMorphTargets, CpuNode, CpuPrimitive,
-        CpuSkin, DecodedImageBudget, GltfAssetTemplate, Interpolation, MaterialExtensionFactors,
-        MAX_GLTF_IMAGE_DIMENSION,
+        decode_cpu_from_slice, decode_cpu_from_slice_with_limits, decode_cpu_with_limits,
+        decode_image_bytes, extract_static_template, finite_material_product_or, gltf_alpha_mode,
+        gltf_alpha_mode_or_default, image_format, import_images_with_budget, joint_edges,
+        load_from_slice, material_extension_factors, read_data_uri, triangle_faces_from_indices,
+        validate_animation_output_cardinality, validate_animation_quat, validate_animation_times,
+        validate_animation_vec3, validate_cpu_template, validate_document_decode_limits,
+        validate_material_texture_sources, validate_parent_graph, CpuAnimationOutput, CpuImage,
+        CpuMaterial, CpuMesh, CpuMorphTargets, CpuNode, CpuPrimitive, CpuSkin, DecodedImageBudget,
+        EncodedResourceBudget, GltfAssetTemplate, GltfDecodeLimits, Interpolation,
+        MaterialExtensionFactors, MAX_GLTF_IMAGE_DIMENSION,
     };
     use crate::scene::AlphaMode;
+    use crate::scene::SceneNode3d;
+    use crate::window::{CanvasSetup, Window};
     use glamx::{Quat, Vec3};
     use image::{DynamicImage, GenericImageView, ImageFormat};
     use std::collections::HashSet;
+    use std::convert::TryInto;
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -1939,6 +2738,617 @@ mod tests {
 
     fn fixture_template(bytes: &[u8]) -> GltfAssetTemplate {
         decode_cpu_from_slice(bytes).expect("template should validate")
+    }
+
+    fn source_limits(max_source_bytes: u64, max_json_bytes: u64) -> GltfDecodeLimits {
+        GltfDecodeLimits {
+            max_source_bytes,
+            max_json_bytes,
+            ..GltfDecodeLimits::default()
+        }
+    }
+
+    const ANIMATION_FIXTURE: &str = r#"{
+        "asset": { "version": "2.0" },
+        "buffers": [{ "byteLength": 0 }],
+        "bufferViews": [{ "buffer": 0, "byteLength": 0 }],
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "componentType": 5126, "count": 2, "type": "VEC3" }
+        ],
+        "nodes": [{}],
+        "animations": [{
+            "samplers": [{ "input": 0, "output": 1 }],
+            "channels": [{
+                "sampler": 0,
+                "target": { "node": 0, "path": "translation" }
+            }]
+        }]
+    }"#;
+
+    const CUBIC_ANIMATION_FIXTURE: &str = r#"{
+        "asset": { "version": "2.0" },
+        "buffers": [{ "byteLength": 0 }],
+        "bufferViews": [{ "buffer": 0, "byteLength": 0 }],
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR" },
+            { "bufferView": 0, "componentType": 5126, "count": 6, "type": "VEC3" }
+        ],
+        "nodes": [{}],
+        "animations": [{
+            "samplers": [{
+                "input": 0,
+                "output": 1,
+                "interpolation": "CUBICSPLINE"
+            }],
+            "channels": [{
+                "sampler": 0,
+                "target": { "node": 0, "path": "translation" }
+            }]
+        }]
+    }"#;
+
+    fn assert_invalid_data(error: gltf::Error) {
+        assert!(matches!(
+            error,
+            gltf::Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    fn assert_invalid_data_message(error: gltf::Error, expected: &[&str]) {
+        match error {
+            gltf::Error::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                let message = error.to_string();
+                for part in expected {
+                    assert!(message.contains(part), "{:?} missing {:?}", message, part);
+                }
+            }
+            other => panic!("expected InvalidData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gltf_decode_limits_default_matches_renderer_source_contract() {
+        let limits = GltfDecodeLimits::default();
+
+        assert_eq!(limits.max_source_bytes, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_json_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_declared_buffer_bytes, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_images, 256);
+        assert_eq!(limits.max_accessor_elements, 100_000_000);
+        assert_eq!(limits.max_accessor_bytes, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_external_resource_bytes, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_nodes, 262_144);
+        assert_eq!(limits.max_skins, 65_536);
+        assert_eq!(limits.max_skin_joint_references, 262_144);
+        assert_eq!(limits.max_meshes, 262_144);
+        assert_eq!(limits.max_primitives, 262_144);
+        assert_eq!(limits.max_materials, 262_144);
+        assert_eq!(limits.max_animations, 64);
+        assert_eq!(limits.max_animation_channels, 65_536);
+        assert_eq!(limits.max_animation_key_values, 1_000_000);
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_template_collection_counts_before_import() {
+        let primitive_fixture = r#"{
+            "asset": { "version": "2.0" },
+            "buffers": [{ "byteLength": 0 }],
+            "bufferViews": [{ "buffer": 0, "byteLength": 0 }],
+            "accessors": [{
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": 0,
+                "type": "VEC3",
+                "min": [0, 0, 0],
+                "max": [0, 0, 0]
+            }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 } }] }]
+        }"#;
+        let cases: &[(&str, &str, fn(&mut GltfDecodeLimits))] = &[
+            (
+                r#"{ "asset": { "version": "2.0" }, "nodes": [{}] }"#,
+                "node count",
+                |limits| limits.max_nodes = 0,
+            ),
+            (
+                r#"{
+                    "asset": { "version": "2.0" },
+                    "nodes": [{}],
+                    "skins": [{ "joints": [0] }]
+                }"#,
+                "skin count",
+                |limits| limits.max_skins = 0,
+            ),
+            (
+                r#"{
+                    "asset": { "version": "2.0" },
+                    "nodes": [{}],
+                    "skins": [{ "joints": [0] }]
+                }"#,
+                "skin joint references",
+                |limits| limits.max_skin_joint_references = 0,
+            ),
+            (
+                r#"{
+                    "asset": { "version": "2.0" },
+                    "meshes": [{ "primitives": [] }]
+                }"#,
+                "mesh count",
+                |limits| limits.max_meshes = 0,
+            ),
+            (primitive_fixture, "primitive count", |limits| {
+                limits.max_primitives = 0
+            }),
+            (
+                r#"{
+                    "asset": { "version": "2.0" },
+                    "materials": [{}]
+                }"#,
+                "material count",
+                |limits| limits.max_materials = 0,
+            ),
+        ];
+
+        for (json, field, configure) in cases {
+            let mut limits = source_limits(json.len() as u64, json.len() as u64);
+            configure(&mut limits);
+            let error = decode_cpu_from_slice_with_limits(json.as_bytes(), &limits)
+                .expect_err("template collection limit must reject before import");
+            assert_invalid_data_message(error, &[field, "limit"]);
+        }
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_animation_collections_and_key_values() {
+        let mut limits = source_limits(
+            ANIMATION_FIXTURE.len() as u64,
+            ANIMATION_FIXTURE.len() as u64,
+        );
+        limits.max_animations = 0;
+        let error = decode_cpu_from_slice_with_limits(ANIMATION_FIXTURE.as_bytes(), &limits)
+            .expect_err("animation count limit must reject before import");
+        assert_invalid_data_message(error, &["animation count", "1", "0"]);
+
+        let mut limits = source_limits(
+            ANIMATION_FIXTURE.len() as u64,
+            ANIMATION_FIXTURE.len() as u64,
+        );
+        limits.max_animation_channels = 0;
+        let error = decode_cpu_from_slice_with_limits(ANIMATION_FIXTURE.as_bytes(), &limits)
+            .expect_err("animation channel limit must reject before import");
+        assert_invalid_data_message(error, &["animation channel count", "1", "0"]);
+
+        let mut limits = source_limits(
+            ANIMATION_FIXTURE.len() as u64,
+            ANIMATION_FIXTURE.len() as u64,
+        );
+        limits.max_animation_key_values = 1;
+        let error = decode_cpu_from_slice_with_limits(ANIMATION_FIXTURE.as_bytes(), &limits)
+            .expect_err("animation input value limit must reject before import");
+        assert_invalid_data_message(error, &["animation input key values", "2", "1"]);
+
+        let mut limits = source_limits(
+            CUBIC_ANIMATION_FIXTURE.len() as u64,
+            CUBIC_ANIMATION_FIXTURE.len() as u64,
+        );
+        limits.max_animation_key_values = 2;
+        let error = decode_cpu_from_slice_with_limits(CUBIC_ANIMATION_FIXTURE.as_bytes(), &limits)
+            .expect_err("cubic animation output value limit must reject before import");
+        assert_invalid_data_message(error, &["animation output key values", "6", "2"]);
+    }
+
+    #[test]
+    fn document_animation_reference_panics_become_invalid_data() {
+        let malformed_sampler = r#"{
+            "asset": { "version": "2.0" },
+            "nodes": [{}],
+            "animations": [{
+                "samplers": [],
+                "channels": [{
+                    "sampler": 0,
+                    "target": { "node": 0, "path": "translation" }
+                }]
+            }]
+        }"#;
+        let document = gltf::Gltf::from_slice_without_validation(malformed_sampler.as_bytes())
+            .expect("malformed sampler fixture should deserialize")
+            .document;
+        let error = validate_document_decode_limits(&document, &GltfDecodeLimits::default())
+            .expect_err("invalid sampler reference must reject without panicking");
+        assert_invalid_data_message(error, &["invalid sampler reference"]);
+
+        let malformed_target = ANIMATION_FIXTURE.replace("\"node\": 0", "\"node\": 9");
+        let limits = source_limits(malformed_target.len() as u64, malformed_target.len() as u64);
+        let error = decode_cpu_from_slice_with_limits(malformed_target.as_bytes(), &limits)
+            .expect_err("invalid target node reference must reject without panicking");
+        assert_invalid_data_message(error, &["invalid target node reference"]);
+    }
+
+    #[test]
+    fn document_skin_joint_reference_out_of_range_is_invalid_data() {
+        let malformed_skin = r#"{
+            "asset": { "version": "2.0" },
+            "nodes": [{}],
+            "skins": [{ "joints": [3] }]
+        }"#;
+        let document = gltf::Gltf::from_slice_without_validation(malformed_skin.as_bytes())
+            .expect("malformed skin fixture should deserialize")
+            .document;
+        let error = validate_document_decode_limits(&document, &GltfDecodeLimits::default())
+            .expect_err("out-of-range skin joint must reject before import");
+        assert_invalid_data_message(error, &["skin 0", "joint 0", "node 3"]);
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_declared_buffer_bytes_before_import() {
+        let json = br#"{
+            "asset": { "version": "2.0" },
+            "buffers": [{ "byteLength": 17 }]
+        }"#;
+        let source_bytes = json.len() as u64;
+        let mut limits = source_limits(source_bytes, source_bytes);
+        limits.max_declared_buffer_bytes = 16;
+
+        let error = decode_cpu_from_slice_with_limits(json, &limits)
+            .expect_err("declared buffer byte limit must reject before import");
+        assert_invalid_data_message(error, &["declared buffer bytes", "17", "16"]);
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_external_data_uri_aggregate_before_decode() {
+        let image = tiny_png();
+        let payload = base64::encode(&image);
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "data:application/octet-stream;base64,{payload}", "byteLength": {} }}],
+                "images": [{{ "uri": "data:image/png;base64,{payload}" }}]
+            }}"#,
+            image.len()
+        );
+        let source_bytes = json.len() as u64;
+        let mut limits = source_limits(source_bytes, source_bytes);
+        limits.max_external_resource_bytes = image.len() as u64 + 1;
+
+        let error = decode_cpu_from_slice_with_limits(json.as_bytes(), &limits)
+            .expect_err("aggregate data URI budget must reject before image decode");
+        assert_invalid_data_message(error, &["external encoded resource", "limit"]);
+    }
+
+    #[test]
+    fn decode_cpu_data_uri_budget_accepts_exact_decoded_boundary() {
+        let data = tiny_png();
+        let payload = base64::encode(&data);
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "data:application/octet-stream;base64,{payload}", "byteLength": {} }}]
+            }}"#,
+            data.len()
+        );
+        let source_bytes = json.len() as u64;
+        let mut exact_limits = source_limits(source_bytes, source_bytes);
+        exact_limits.max_external_resource_bytes = data.len() as u64;
+        decode_cpu_from_slice_with_limits(json.as_bytes(), &exact_limits)
+            .expect("exact decoded data URI budget must pass");
+
+        let mut short_limits = exact_limits;
+        short_limits.max_external_resource_bytes -= 1;
+        let error = decode_cpu_from_slice_with_limits(json.as_bytes(), &short_limits)
+            .expect_err("one byte below decoded data URI budget must reject");
+        assert_invalid_data_message(error, &["external encoded resource", "limit"]);
+    }
+
+    #[test]
+    fn data_uri_invalid_base64_shape_keeps_base64_error_contract() {
+        let error = read_data_uri("A=", &mut EncodedResourceBudget::new(0))
+            .expect_err("invalid base64 padding must fail as a base64 error");
+        assert!(matches!(error, gltf::Error::Base64(_)));
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_relative_buffer_and_image_aggregate() {
+        let root = temp_image_path().with_extension("resources");
+        fs::create_dir_all(&root).expect("create resource directory");
+        let buffer = [1_u8, 2, 3];
+        let image = tiny_png();
+        fs::write(root.join("buffer.bin"), buffer).expect("write external buffer");
+        fs::write(root.join("image.png"), &image).expect("write external image");
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "buffer.bin", "byteLength": {} }}],
+                "images": [{{ "uri": "image.png" }}]
+            }}"#,
+            buffer.len()
+        );
+        let path = root.join("fixture.gltf");
+        fs::write(&path, json.as_bytes()).expect("write external URI fixture");
+        let mut limits = source_limits(json.len() as u64, json.len() as u64);
+        limits.max_external_resource_bytes = (buffer.len() + image.len() - 1) as u64;
+
+        let error = decode_cpu_with_limits(&path, &limits)
+            .expect_err("relative buffer and image aggregate must reject");
+        assert_invalid_data_message(error, &["external encoded resource", "limit"]);
+
+        fs::remove_dir_all(root).expect("remove resource directory");
+    }
+
+    #[test]
+    fn decode_cpu_slice_limits_reject_external_filesystem_reference() {
+        let json = br#"{
+            "asset": { "version": "2.0" },
+            "buffers": [{ "uri": "buffer.bin", "byteLength": 1 }]
+        }"#;
+        let source_bytes = json.len() as u64;
+        let limits = source_limits(source_bytes, source_bytes);
+
+        let error = decode_cpu_from_slice_with_limits(json, &limits)
+            .expect_err("slice decode must reject external filesystem references");
+        assert!(matches!(error, gltf::Error::ExternalReferenceInSliceImport));
+    }
+
+    #[test]
+    fn decode_cpu_path_preserves_relative_file_and_data_uri_sources() {
+        let root = temp_image_path().with_extension("parity");
+        fs::create_dir_all(&root).expect("create resource directory");
+        let buffer = [1_u8, 2, 3];
+        let image = tiny_png();
+        fs::write(root.join("buffer.bin"), buffer).expect("write external buffer");
+        fs::write(root.join("relative.png"), &image).expect("write relative image");
+        let file_uri = format!(
+            "file://{}",
+            root.join("file.png").to_string_lossy().replace('\\', "/")
+        );
+        fs::write(root.join("file.png"), &image).expect("write file URI image");
+        let payload = base64::encode(&image);
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "buffer.bin", "byteLength": {} }}],
+                "images": [
+                    {{ "uri": "relative.png" }},
+                    {{ "uri": "{}" }},
+                    {{ "uri": "data:image/png;base64,{payload}" }}
+                ]
+            }}"#,
+            buffer.len(),
+            file_uri
+        );
+        let path = root.join("fixture.gltf");
+        fs::write(&path, json.as_bytes()).expect("write URI parity fixture");
+        let limits = source_limits(json.len() as u64, json.len() as u64);
+
+        decode_cpu_with_limits(&path, &limits).expect("relative/file/data URI sources decode");
+
+        fs::remove_dir_all(root).expect("remove resource directory");
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_image_count_before_image_import() {
+        let images = (0..257)
+            .map(|_| r#"{"uri":"data:,"}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"asset":{{"version":"2.0"}},"images":[{images}]}}"#);
+        let source_bytes = json.len() as u64;
+        let mut limits = source_limits(source_bytes, source_bytes);
+        limits.max_images = 256;
+
+        let error = decode_cpu_from_slice_with_limits(json.as_bytes(), &limits)
+            .expect_err("image count limit must reject before image import");
+        assert_invalid_data_message(error, &["image count", "257", "256"]);
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_accessor_element_and_byte_totals_before_import() {
+        let json = br#"{
+            "asset": { "version": "2.0" },
+            "buffers": [{ "byteLength": 0 }],
+            "bufferViews": [{ "buffer": 0, "byteLength": 0 }],
+            "accessors": [{ "bufferView": 0, "count": 2, "componentType": 5126, "type": "VEC4" }]
+        }"#;
+        let source_bytes = json.len() as u64;
+
+        let mut element_limits = source_limits(source_bytes, source_bytes);
+        element_limits.max_accessor_elements = 1;
+        let element_error = decode_cpu_from_slice_with_limits(json, &element_limits)
+            .expect_err("accessor element limit must reject before import");
+        assert_invalid_data_message(element_error, &["accessor elements", "2", "1"]);
+
+        let mut byte_limits = source_limits(source_bytes, source_bytes);
+        byte_limits.max_accessor_elements = 2;
+        byte_limits.max_accessor_bytes = 31;
+        let byte_error = decode_cpu_from_slice_with_limits(json, &byte_limits)
+            .expect_err("accessor byte limit must reject before import");
+        assert_invalid_data_message(byte_error, &["accessor bytes", "32", "31"]);
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_oversized_json_path_before_parser() {
+        let path = temp_image_path().with_extension("gltf");
+        let json = br#"{"asset":{"version":"2.0"}}"#;
+        fs::write(&path, json).expect("write JSON fixture");
+
+        let source_bytes = json.len() as u64;
+        assert!(decode_cpu_with_limits(&path, &source_limits(source_bytes, source_bytes)).is_ok());
+
+        let source_error =
+            decode_cpu_with_limits(&path, &source_limits(source_bytes - 1, source_bytes))
+                .expect_err("source limit must reject before parsing");
+        assert_invalid_data(source_error);
+        let json_error =
+            decode_cpu_with_limits(&path, &source_limits(source_bytes, source_bytes - 1))
+                .expect_err("JSON limit must reject before parsing");
+        assert_invalid_data(json_error);
+
+        fs::remove_file(path).expect("remove JSON fixture");
+    }
+
+    #[test]
+    fn decode_cpu_slice_limits_reject_oversized_json_before_parser() {
+        let json = br#"{"asset":{"version":"2.0"}}"#;
+        let source_bytes = json.len() as u64;
+
+        assert!(decode_cpu_from_slice_with_limits(
+            json,
+            &source_limits(source_bytes, source_bytes),
+        )
+        .is_ok());
+        let source_error =
+            decode_cpu_from_slice_with_limits(json, &source_limits(source_bytes - 1, source_bytes))
+                .expect_err("source limit must reject before parsing");
+        assert_invalid_data(source_error);
+        let json_error =
+            decode_cpu_from_slice_with_limits(json, &source_limits(source_bytes, source_bytes - 1))
+                .expect_err("JSON limit must reject before parsing");
+        assert_invalid_data(json_error);
+    }
+
+    #[test]
+    fn decode_cpu_slice_limits_reject_oversized_declared_glb_length() {
+        let mut glb = json_glb(r#"{"asset":{"version":"2.0"}}"#);
+        let source_bytes = glb.len() as u64;
+        let declared_length = (source_bytes + 1) as u32;
+        glb[8..12].copy_from_slice(&declared_length.to_le_bytes());
+
+        let error =
+            decode_cpu_from_slice_with_limits(&glb, &source_limits(source_bytes, source_bytes))
+                .expect_err("declared GLB length must reject before parsing");
+        assert_invalid_data(error);
+    }
+
+    #[test]
+    fn decode_cpu_slice_limits_reject_short_declared_glb_length() {
+        let mut glb = json_glb(r#"{"asset":{"version":"2.0"}}"#);
+        let source_bytes = glb.len() as u64;
+        let declared_length = (source_bytes - 1) as u32;
+        glb[8..12].copy_from_slice(&declared_length.to_le_bytes());
+
+        let error =
+            decode_cpu_from_slice_with_limits(&glb, &source_limits(source_bytes, source_bytes))
+                .expect_err("short declared GLB length must reject trailing data");
+        assert_invalid_data(error);
+    }
+
+    #[test]
+    fn decode_cpu_limits_reject_oversized_glb_json_path_before_parser() {
+        let path = temp_image_path().with_extension("glb");
+        let glb = json_glb(r#"{"asset":{"version":"2.0"}}"#);
+        let source_bytes = glb.len() as u64;
+        let json_bytes = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as u64;
+        fs::write(&path, &glb).expect("write GLB fixture");
+
+        assert!(decode_cpu_with_limits(&path, &source_limits(source_bytes, json_bytes)).is_ok());
+        let error = decode_cpu_with_limits(&path, &source_limits(source_bytes, json_bytes - 1))
+            .expect_err("GLB JSON limit must reject before parsing");
+        assert_invalid_data(error);
+
+        fs::remove_file(path).expect("remove GLB fixture");
+    }
+
+    #[test]
+    fn decode_cpu_slice_limits_reject_oversized_glb_json_chunk() {
+        let mut glb = json_glb(r#"{"asset":{"version":"2.0"}}"#);
+        let source_bytes = glb.len() as u64;
+        let json_length = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as u64;
+        assert!(
+            decode_cpu_from_slice_with_limits(&glb, &source_limits(source_bytes, json_length),)
+                .is_ok()
+        );
+
+        let oversized_json_length = (json_length + 1) as u32;
+        glb[12..16].copy_from_slice(&oversized_json_length.to_le_bytes());
+        let error =
+            decode_cpu_from_slice_with_limits(&glb, &source_limits(source_bytes, json_length))
+                .expect_err("JSON chunk limit must reject before parsing");
+        assert_invalid_data(error);
+    }
+
+    fn decode_single_material(alpha_fields: &str) -> CpuMaterial {
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "materials": [{{ {alpha_fields} }}]
+            }}"#
+        );
+        let template = decode_cpu_from_slice(&json_glb(&json)).expect("material should decode");
+        template
+            .materials
+            .into_iter()
+            .next()
+            .expect("fixture should contain one material")
+    }
+
+    #[test]
+    fn cpu_material_alpha_opaque_maps_to_opaque() {
+        let material = decode_single_material(r#""alphaMode": "OPAQUE""#);
+
+        assert_eq!(material.alpha_mode, AlphaMode::Opaque);
+        assert_eq!(material.alpha_cutoff, None);
+    }
+
+    #[test]
+    fn cpu_material_alpha_mask_preserves_cutoff_and_default() {
+        let explicit = decode_single_material(r#""alphaMode": "MASK", "alphaCutoff": 0.25"#);
+        assert_eq!(explicit.alpha_mode, AlphaMode::Mask(0.25));
+        assert_eq!(explicit.alpha_cutoff, Some(0.25));
+
+        let default = decode_single_material(r#""alphaMode": "MASK""#);
+        assert_eq!(default.alpha_mode, AlphaMode::Mask(0.5));
+        assert_eq!(default.alpha_cutoff, Some(0.5));
+    }
+
+    #[test]
+    fn cpu_material_alpha_blend_maps_to_blend() {
+        let material = decode_single_material(r#""alphaMode": "BLEND""#);
+
+        assert_eq!(material.alpha_mode, AlphaMode::Blend);
+        assert_eq!(material.alpha_cutoff, None);
+    }
+
+    fn first_mesh_info(node: &SceneNode3d) -> Option<(usize, (u32, u32))> {
+        let data = node.data();
+        if let Some(object) = data.object() {
+            return Some((
+                object.mesh().borrow().num_pts(),
+                object.data().texture().size,
+            ));
+        }
+        data.children().iter().find_map(first_mesh_info)
+    }
+
+    #[test]
+    fn headless_box_textured_runtime_load_releases_resources() {
+        pollster::block_on(async {
+            let window = Window::new_headless_with_setup(64, 64, CanvasSetup::default()).await;
+            {
+                let model = load_from_slice(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/examples/media/gltf/BoxTextured.glb"
+                )))
+                .expect("BoxTextured should load through the runtime loader");
+
+                let scene = model.root.clone();
+
+                let (num_points, (width, height)) = first_mesh_info(&model.root)
+                    .expect("BoxTextured should produce a mesh object node");
+                assert!(num_points > 0);
+                assert!(
+                    width > 1 && height > 1,
+                    "runtime texture must not be the 1x1 placeholder: {width}x{height}",
+                    width = width,
+                    height = height
+                );
+
+                drop(model);
+                drop(scene);
+            }
+
+            drop(window);
+        });
     }
 
     #[test]
@@ -2164,6 +3574,8 @@ mod tests {
         assert_eq!(material.metallic, 0.0);
         assert_eq!(material.roughness, 1.0);
         assert_eq!(material.emissive, [0.0, 0.0, 0.0]);
+        assert_eq!(material.alpha_mode, AlphaMode::Opaque);
+        assert_eq!(material.alpha_cutoff, None);
         assert_eq!(
             material.extensions,
             MaterialExtensionFactors {

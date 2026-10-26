@@ -134,6 +134,11 @@ impl Canvas {
         self.canvas.resize(width, height)
     }
 
+    /// Explicit same-size surface recovery for embedding hosts.
+    pub fn reconfigure_surface(&self) {
+        self.canvas.reconfigure_surface()
+    }
+
     /// Gets the current surface texture for rendering.
     pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
         self.canvas.get_current_texture()
@@ -216,6 +221,26 @@ impl Canvas {
     /// Set the cursor grabbing behaviour.
     pub fn set_cursor_grab(&self, grab: bool) {
         self.canvas.set_cursor_grab(grab);
+    }
+
+    /// Enter or leave borderless fullscreen on the current monitor.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.canvas.set_fullscreen(fullscreen);
+    }
+
+    /// Show or hide the platform's on-screen keyboard (mobile; no-op elsewhere).
+    pub fn set_keyboard_visible(&self, visible: bool) {
+        self.canvas.set_keyboard_visible(visible);
+    }
+
+    /// Whether the window is currently fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.canvas.is_fullscreen()
+    }
+
+    /// Files dropped onto the window since the last call, in drop order.
+    pub fn take_dropped_files(&self) -> Vec<std::path::PathBuf> {
+        self.canvas.take_dropped_files()
     }
 
     /// Set the cursor position.

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-thread_local!(static KEY_MATERIAL_MANAGER: RefCell<MaterialManager2d> = RefCell::new(MaterialManager2d::new()));
+thread_local!(static KEY_MATERIAL_MANAGER: RefCell<Option<MaterialManager2d>> = const { RefCell::new(None) });
 
 /// The material manager.
 ///
@@ -46,7 +46,10 @@ impl MaterialManager2d {
 
     /// Mutably applies a function to the material manager.
     pub fn get_global_manager<T, F: FnMut(&mut MaterialManager2d) -> T>(mut f: F) -> T {
-        KEY_MATERIAL_MANAGER.with(|manager| f(&mut manager.borrow_mut()))
+        KEY_MATERIAL_MANAGER.with(|manager| {
+            let mut manager = manager.borrow_mut();
+            f(manager.get_or_insert_with(MaterialManager2d::new))
+        })
     }
 
     /// Gets the default material to draw objects.
@@ -96,10 +99,8 @@ impl MaterialManager2d {
     /// to avoid TLS access order issues with wgpu internals.
     pub fn reset_global_manager() {
         KEY_MATERIAL_MANAGER.with(|manager| {
-            let mut manager = manager.borrow_mut();
-            manager.materials.clear();
-            // Recreate default material to satisfy type requirements
-            // (but it will be unused since context is being reset)
+            let manager = manager.borrow_mut().take();
+            drop(manager);
         });
     }
 }

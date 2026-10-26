@@ -40,6 +40,11 @@ impl Default for TriangleRenderer3d {
 }
 
 impl TriangleRenderer3d {
+    /// Discards overlay triangles when a frame cannot be acquired.
+    pub fn clear(&mut self) {
+        self.vertices.clear();
+    }
+
     pub fn new() -> Self {
         let ctxt = Context::get();
         let bind_group_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

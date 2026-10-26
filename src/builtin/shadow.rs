@@ -225,6 +225,9 @@ pub struct ShadowMapper {
     enabled: bool,
     /// Atlas resolution (per layer, square).
     resolution: u32,
+    /// Atlas layers allocated (`1..=MAX_SHADOW_VIEWS`); lights whose views do not
+    /// fit keep lighting without shadows.
+    atlas_layers: u32,
     /// Slope-scaled-ish constant depth bias used by the PCF comparison.
     depth_bias: f32,
     /// Shadow-edge softness: scales the PCF tap spacing (`1.0` = default ~5x5
@@ -307,10 +310,11 @@ impl ShadowMapper {
     pub fn new(resolution: u32) -> Self {
         let ctxt = Context::get();
         let resolution = resolution.max(1);
+        let atlas_layers = MAX_SHADOW_VIEWS as u32;
 
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution);
+        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, atlas_layers);
         let (transmittance_atlas, transmittance_layer_views, transmittance_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution);
+            Self::create_transmittance_atlas(&ctxt, resolution, atlas_layers);
 
         // Comparison sampler: hardware does the depth test and (with linear
         // filtering) bilinear PCF across the 2x2 neighborhood per tap.
@@ -431,13 +435,17 @@ impl ShadowMapper {
 
         // Deformed depth/transmittance pipelines: the deform data is bound as a 3rd
         // bind group (4th for transmittance, which also needs the albedo texture), so
-        // these stay within WebGPU's 4-bind-group cap and run on every target —
-        // including web, where the color pass already deforms skinned/morphed meshes.
-        // Gating these off on web would leave the shadow map in the rest pose while the
-        // lit geometry is animated, self-shadowing the moved surfaces (acne). The
-        // deform bind-group layout is the shared one from `builtin::deform`, so each
+        // these stay within WebGPU's 4-bind-group cap and run on every target where
+        // deform runs at all — including WebGPU browsers, where the color pass
+        // deforms skinned/morphed meshes. Gating these off where the color pass
+        // deforms would leave the shadow map in the rest pose while the lit geometry
+        // is animated, self-shadowing the moved surfaces (acne). The deform
+        // bind-group layout is the shared one from `builtin::deform`, so each
         // object's deform bind group works in both the color and shadow passes.
-        let (deform_depth_pipeline, deform_transmittance_pipeline) = {
+        // Where the device cannot bind the deform group (WebGL2, Android GLES; see
+        // `Context::supports_deform`) the color pass draws rest poses too, so a
+        // rest-pose shadow map is consistent rather than acne-prone.
+        let (deform_depth_pipeline, deform_transmittance_pipeline) = if ctxt.supports_deform() {
             let deform_layout = crate::builtin::deform::deform_bind_group_layout();
             let depth = Self::create_depth_pipeline_deform(
                 &ctxt,
@@ -453,6 +461,8 @@ impl ShadowMapper {
                 &transmittance_tex_bgl,
             );
             (Some(depth), Some(transmittance))
+        } else {
+            (None, None)
         };
 
         let view_capacity = MAX_SHADOW_VIEWS as u64;
@@ -504,6 +514,7 @@ impl ShadowMapper {
         Self {
             enabled: true,
             resolution,
+            atlas_layers,
             depth_bias: 0.0012,
             softness: 1.0,
             num_cascades: 4,
@@ -661,13 +672,14 @@ impl ShadowMapper {
     fn create_atlas(
         ctxt: &Context,
         resolution: u32,
+        layers: u32,
     ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_atlas"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: MAX_SHADOW_VIEWS as u32,
+                depth_or_array_layers: layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -677,7 +689,7 @@ impl ShadowMapper {
             view_formats: &[],
         });
 
-        let layer_views = (0..MAX_SHADOW_VIEWS as u32)
+        let layer_views = (0..layers)
             .map(|layer| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow_atlas_layer"),
@@ -704,13 +716,14 @@ impl ShadowMapper {
     fn create_transmittance_atlas(
         ctxt: &Context,
         resolution: u32,
+        layers: u32,
     ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_transmittance_atlas"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: MAX_SHADOW_VIEWS as u32,
+                depth_or_array_layers: layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -720,7 +733,7 @@ impl ShadowMapper {
             view_formats: &[],
         });
 
-        let layer_views = (0..MAX_SHADOW_VIEWS as u32)
+        let layer_views = (0..layers)
             .map(|layer| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow_transmittance_layer"),
@@ -804,7 +817,7 @@ impl ShadowMapper {
         // and the instance deformation columns (2..4).
         let vertex_buffer_layouts = [
             // Buffer 0: vertex positions.
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -812,9 +825,9 @@ impl ShadowMapper {
                     shader_location: 0,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
+            }),
             // Buffer 1: instance translations.
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[wgpu::VertexAttribute {
@@ -822,9 +835,9 @@ impl ShadowMapper {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
+            }),
             // Buffer 2: instance deformations (3 vec3 columns).
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 9]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -844,7 +857,7 @@ impl ShadowMapper {
                         format: wgpu::VertexFormat::Float32x3,
                     },
                 ],
-            },
+            }),
         ];
 
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -853,7 +866,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts.map(Some),
+                buffers: &vertex_buffer_layouts,
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -922,7 +935,7 @@ impl ShadowMapper {
 
         // Same buffers 0..2 as the non-deformed pass (position + instance streams).
         let vertex_buffer_layouts = [
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -930,8 +943,8 @@ impl ShadowMapper {
                     shader_location: 0,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[wgpu::VertexAttribute {
@@ -939,8 +952,8 @@ impl ShadowMapper {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 9]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -960,7 +973,7 @@ impl ShadowMapper {
                         format: wgpu::VertexFormat::Float32x3,
                     },
                 ],
-            },
+            }),
         ];
 
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -969,7 +982,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts.map(Some),
+                buffers: &vertex_buffer_layouts,
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -1037,7 +1050,7 @@ impl ShadowMapper {
         // Same buffers 0..2 as the non-deformed pass plus UVs (buffer 3, location 5)
         // for the albedo texture lookup.
         let vertex_buffer_layouts = [
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -1045,8 +1058,8 @@ impl ShadowMapper {
                     shader_location: 0,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[wgpu::VertexAttribute {
@@ -1054,8 +1067,8 @@ impl ShadowMapper {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 9]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -1075,9 +1088,9 @@ impl ShadowMapper {
                         format: wgpu::VertexFormat::Float32x3,
                     },
                 ],
-            },
+            }),
             // Buffer 3: UVs (for the albedo texture lookup).
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -1085,7 +1098,7 @@ impl ShadowMapper {
                     shader_location: 5,
                     format: wgpu::VertexFormat::Float32x2,
                 }],
-            },
+            }),
         ];
 
         let mult_blend = wgpu::BlendComponent {
@@ -1100,7 +1113,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts.map(Some),
+                buffers: &vertex_buffer_layouts,
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1179,7 +1192,7 @@ impl ShadowMapper {
         // translation (1), instance deformation columns (2..4), plus UVs (slot 3,
         // location 7) for the albedo texture lookup.
         let vertex_buffer_layouts = [
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -1187,8 +1200,8 @@ impl ShadowMapper {
                     shader_location: 0,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[wgpu::VertexAttribute {
@@ -1196,8 +1209,8 @@ impl ShadowMapper {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 9]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -1217,9 +1230,9 @@ impl ShadowMapper {
                         format: wgpu::VertexFormat::Float32x3,
                     },
                 ],
-            },
+            }),
             // Buffer 3: UVs.
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -1227,7 +1240,7 @@ impl ShadowMapper {
                     shader_location: 7,
                     format: wgpu::VertexFormat::Float32x2,
                 }],
-            },
+            }),
         ];
 
         // Multiplicative blend: result = src * dst. The atlas is cleared to white,
@@ -1244,7 +1257,7 @@ impl ShadowMapper {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffer_layouts.map(Some),
+                buffers: &vertex_buffer_layouts,
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1369,20 +1382,49 @@ impl ShadowMapper {
         self.first_cascade_far_bound = bound.max(0.01);
     }
 
+    /// Far view distance of the highest-resolution directional cascade.
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.first_cascade_far_bound
+    }
+
     /// Sets the shadow atlas per-layer resolution, reallocating the atlas.
     pub fn set_resolution(&mut self, resolution: u32) {
         let resolution = resolution.max(1);
         if resolution == self.resolution {
             return;
         }
-        let ctxt = Context::get();
         self.resolution = resolution;
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution);
+        self.reallocate_atlases();
+    }
+
+    /// Number of atlas layers allocated (the default is [`MAX_SHADOW_VIEWS`]).
+    pub fn atlas_layers(&self) -> u32 {
+        self.atlas_layers
+    }
+
+    /// Sets how many atlas layers are allocated (`1..=MAX_SHADOW_VIEWS`),
+    /// reallocating the atlas. A directional light needs one layer per cascade,
+    /// a spot light one, a point light six; lights that do not fit keep lighting
+    /// without shadows. Fewer layers make a higher `resolution` affordable: the
+    /// atlas costs `resolution² × layers × 8` bytes (depth plus transmittance).
+    pub fn set_atlas_layers(&mut self, layers: u32) {
+        let layers = layers.clamp(1, MAX_SHADOW_VIEWS as u32);
+        if layers == self.atlas_layers {
+            return;
+        }
+        self.atlas_layers = layers;
+        self.reallocate_atlases();
+    }
+
+    fn reallocate_atlases(&mut self) {
+        let ctxt = Context::get();
+        let (atlas, layer_views, array_view) =
+            Self::create_atlas(&ctxt, self.resolution, self.atlas_layers);
         self.atlas = atlas;
         self.layer_views = layer_views;
         self.array_view = array_view;
         let (t_atlas, t_layer_views, t_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution);
+            Self::create_transmittance_atlas(&ctxt, self.resolution, self.atlas_layers);
         self.transmittance_atlas = t_atlas;
         self.transmittance_layer_views = t_layer_views;
         self.transmittance_array_view = t_array_view;
@@ -1484,7 +1526,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > MAX_SHADOW_VIEWS {
+            if next_layer + needed as u32 > self.atlas_layers {
                 // Out of atlas space: this light lights without shadows.
                 continue;
             }
@@ -1512,7 +1554,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > MAX_SHADOW_VIEWS {
+            if next_layer + needed as u32 > self.atlas_layers {
                 // Out of atlas space; a smaller later light might still fit.
                 continue;
             }

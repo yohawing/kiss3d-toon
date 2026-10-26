@@ -361,7 +361,7 @@ impl HdrPipeline {
             ),
         );
 
-        let vertex_layout = wgpu::VertexBufferLayout {
+        let vertex_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
@@ -369,7 +369,7 @@ impl HdrPipeline {
                 shader_location: 0,
                 format: wgpu::VertexFormat::Float32x2,
             }],
-        };
+        });
 
         let bloom_pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("hdr_bloom_pipeline_layout"),
@@ -384,7 +384,7 @@ impl HdrPipeline {
                 vertex: wgpu::VertexState {
                     module: &bloom_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[Some(vertex_layout.clone())],
+                    buffers: &[vertex_layout.clone()],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -559,7 +559,7 @@ impl HdrPipeline {
             vertex: wgpu::VertexState {
                 module: &tonemap_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(vertex_layout.clone())],
+                buffers: &[vertex_layout.clone()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -921,7 +921,7 @@ impl HdrPipeline {
             bind_group_layouts: &[Some(oit_layout)],
             immediate_size: 0,
         });
-        let vertex_layout = wgpu::VertexBufferLayout {
+        let vertex_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
@@ -929,14 +929,14 @@ impl HdrPipeline {
                 shader_location: 0,
                 format: wgpu::VertexFormat::Float32x2,
             }],
-        };
+        });
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("hdr_oit_composite_pipeline"),
             layout: Some(&oit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &oit_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(vertex_layout)],
+                buffers: &[vertex_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
