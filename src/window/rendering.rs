@@ -43,9 +43,22 @@ impl Window {
         scene: &mut SceneNode3d,
         camera: &mut impl Camera3d,
     ) -> RenderFrameStatus {
+        self.render_3d_status_with_chain(scene, camera, &mut [])
+            .await
+    }
+
+    /// Like [`render_3d_status`](Self::render_3d_status), running an ordered
+    /// post-processing `chain` (see [`render_3d_with_chain`](Self::render_3d_with_chain))
+    /// over the tonemapped image. An empty chain is identical to `render_3d_status`.
+    pub async fn render_3d_status_with_chain(
+        &mut self,
+        scene: &mut SceneNode3d,
+        camera: &mut impl Camera3d,
+        chain: &mut [&mut dyn PostProcessingEffect],
+    ) -> RenderFrameStatus {
         let mut default_cam2 = FixedView2d::default();
         self.handle_events(camera, &mut default_cam2);
-        self.render_single_frame_status(Some(scene), None, camera, &mut default_cam2, None, &mut [])
+        self.render_single_frame_status(Some(scene), None, camera, &mut default_cam2, None, chain)
             .await
     }
 
@@ -339,11 +352,13 @@ impl Window {
         // in the material's prepare() based on the camera position
 
         let render_offscreen = offscreen || render_viewport.is_some();
-        let sample_count = if render_viewport.is_some() {
-            1
-        } else {
-            self.canvas.sample_count()
-        };
+        // Partial viewports honor the canvas MSAA setting too: the HDR film is
+        // multisampled at the viewport size and paired with a viewport-sized
+        // multisampled depth (see `depth_view` below).
+        let sample_count = self.canvas.sample_count();
+        if sample_count == 1 || render_viewport.is_none() {
+            self.viewport_msaa_depth = None;
+        }
 
         let ctxt = Context::get();
         let mut encoder = ctxt.create_command_encoder(Some("kiss3d_frame_encoder"));
@@ -402,9 +417,12 @@ impl Window {
         let color_view = self.hdr.scene_render_view().clone();
         let resolve_view = self.hdr.scene_resolve_view().cloned();
 
-        // Partial viewports use their own single-sample depth; full-size and
-        // headless rendering use the canvas depth with its configured MSAA.
-        let depth_view = if render_viewport.is_some() {
+        // Partial viewports use their own viewport-sized depth (multisampled when
+        // MSAA is on); full-size and headless rendering use the canvas depth with
+        // its configured MSAA.
+        let depth_view = if render_viewport.is_some() && sample_count > 1 {
+            self.viewport_msaa_depth_view(w, h, sample_count)
+        } else if render_viewport.is_some() {
             self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
@@ -2157,5 +2175,38 @@ mod tests {
         assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
             SurfaceUnavailableReason::Validation
         )));
+    }
+}
+
+impl Window {
+    /// The viewport-sized multisampled depth view, (re)created when the viewport
+    /// size or sample count changes.
+    fn viewport_msaa_depth_view(
+        &mut self,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> wgpu::TextureView {
+        let key = [width.max(1), height.max(1), samples];
+        if self.viewport_msaa_depth.as_ref().map(|d| d.2) != Some(key) {
+            let texture = Context::get().create_texture(&wgpu::TextureDescriptor {
+                label: Some("viewport_msaa_depth_texture"),
+                size: wgpu::Extent3d {
+                    width: key[0],
+                    height: key[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format: Context::depth_format(),
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.viewport_msaa_depth = Some((texture, view, key));
+        }
+        self.viewport_msaa_depth.as_ref().unwrap().1.clone()
     }
 }
