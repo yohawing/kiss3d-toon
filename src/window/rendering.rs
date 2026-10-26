@@ -684,13 +684,14 @@ impl Window {
         // opaque pass overwrites it wherever geometry is visible. Uses the primary
         // (pass 0) inverse view-projection; since the sky is at infinity this is
         // also correct for stereo (both eyes share the view rotation). No-op when
-        // no skybox environment is set. Recorded into `encoder` here (after the
-        // clear pass, before the opaque pass — command order is preserved), but
+        // no skybox environment is set or its background is hidden (IBL above is
+        // unaffected). Recorded into `encoder` here (after the clear pass, before
+        // the opaque pass — command order is preserved), but
         // *issued* after the probe-capture and planar-reflector passes so its
         // `write_buffer` to the shared skybox uniform is the last one before the
         // main submit (those auxiliary passes reuse the same uniform with their own
         // matrices and would otherwise leave it holding a mirror/cube-face view).
-        if self.skybox.is_set() {
+        if self.skybox.is_set() && self.skybox_background_visible {
             self.skybox.render(
                 &mut encoder,
                 &color_view,
