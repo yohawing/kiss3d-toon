@@ -98,6 +98,7 @@ pub struct Window {
     pub(super) unhandled_events: Rc<RefCell<Vec<WindowEvent>>>,
     pub(super) ambient_intensity: f32,
     pub(super) ambient_color: Color,
+    pub(super) additive_ambient: bool,
     pub(super) fog: crate::light::Fog,
     pub(super) background: Color,
     pub(super) polyline_renderer_2d: PolylineRenderer2d,
@@ -545,6 +546,25 @@ impl Window {
     /// Returns the current ambient light color.
     pub fn ambient_color(&self) -> Color {
         self.ambient_color
+    }
+
+    /// Selects how the flat ambient term combines with image-based lighting
+    /// (default `false`, the original behavior).
+    ///
+    /// `false`: the flat term `ambient_color * ambient * albedo * ao` is used only
+    /// when there is no IBL/reflection probe; IBL replaces it.
+    ///
+    /// `true`: the flat term is a uniform diffuse irradiance like three.js's
+    /// `AmbientLight`: `ambient_color * ambient * albedo * (1 - metallic) * ao`,
+    /// added on top of IBL/probe lighting (and used alone without IBL). Lambert's
+    /// `1/π` is not applied; fold it into [`set_ambient`](Self::set_ambient).
+    pub fn set_additive_ambient(&mut self, additive: bool) {
+        self.additive_ambient = additive;
+    }
+
+    /// Whether the flat ambient term is additive diffuse irradiance.
+    pub fn additive_ambient(&self) -> bool {
+        self.additive_ambient
     }
 
     /// Sets the distance fog applied to the rasterized scene.
@@ -1130,6 +1150,7 @@ impl Window {
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
             ambient_intensity: 0.2,
             ambient_color: crate::color::WHITE,
+            additive_ambient: false,
             fog: crate::light::Fog::default(),
             background: BLACK,
             polyline_renderer_2d: PolylineRenderer2d::new(),
@@ -1224,6 +1245,7 @@ impl Window {
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
             ambient_intensity: 0.2,
             ambient_color: crate::color::WHITE,
+            additive_ambient: false,
             fog: crate::light::Fog::default(),
             background: BLACK,
             polyline_renderer_2d: PolylineRenderer2d::new(),
@@ -1297,6 +1319,7 @@ impl Window {
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
             ambient_intensity: 0.2,
             ambient_color: crate::color::WHITE,
+            additive_ambient: false,
             fog: crate::light::Fog::default(),
             background: BLACK,
             polyline_renderer_2d: PolylineRenderer2d::new(),

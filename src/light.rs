@@ -345,6 +345,9 @@ pub struct LightCollection {
     pub ambient: f32,
     /// Global ambient light color (multiplied by [`ambient`](Self::ambient)).
     pub ambient_color: Color,
+    /// Treat the flat ambient as additive diffuse irradiance (see
+    /// [`Window::set_additive_ambient`](crate::window::Window::set_additive_ambient)).
+    pub additive_ambient: bool,
     /// Distance fog applied to the scene during shading.
     pub fog: Fog,
 }
@@ -362,6 +365,7 @@ impl LightCollection {
             lights: Vec::with_capacity(MAX_LIGHTS),
             ambient: 0.2,
             ambient_color: crate::color::WHITE,
+            additive_ambient: false,
             fog: Fog::default(),
         }
     }
@@ -372,6 +376,7 @@ impl LightCollection {
             lights: Vec::with_capacity(MAX_LIGHTS),
             ambient,
             ambient_color: crate::color::WHITE,
+            additive_ambient: false,
             fog: Fog::default(),
         }
     }

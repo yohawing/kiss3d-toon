@@ -128,7 +128,9 @@ struct FrameUniforms {
     lights: [GpuLight; MAX_LIGHTS],
     num_lights: u32,
     ambient_intensity: f32,
-    _padding: [f32; 2],
+    // 1.0 = additive diffuse ambient (`LightCollection::additive_ambient`), else 0.0.
+    ambient_additive: f32,
+    _padding: f32,
     // Global ambient light color (rgb); a is unused.
     ambient_color: [f32; 4],
     // Distance fog color (rgb) + max fog opacity (a).
@@ -2612,7 +2614,8 @@ impl Material3d for ObjectMaterial {
                 lights: gpu_lights,
                 num_lights: num_primary,
                 ambient_intensity: lights.ambient,
-                _padding: [0.0; 2],
+                ambient_additive: if lights.additive_ambient { 1.0 } else { 0.0 },
+                _padding: 0.0,
                 ambient_color: [
                     lights.ambient_color.r,
                     lights.ambient_color.g,
