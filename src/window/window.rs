@@ -158,6 +158,10 @@ pub struct Window {
     /// Offscreen render target used when the window is hidden, so `snap` and
     /// recording work without a presentable surface. Created on first use.
     pub(super) offscreen_output_target: Option<RenderTarget>,
+    /// Multisampled depth for a partial viewport rendered with MSAA (the
+    /// offscreen target's depth is single-sample). Sized `[width, height,
+    /// samples]`; created on first use and dropped when MSAA is off.
+    pub(super) viewport_msaa_depth: Option<(wgpu::Texture, wgpu::TextureView, [u32; 3])>,
     /// Optional physical-pixel sub-viewport for embedded rendering. The full
     /// scene is rendered offscreen at this size and composited into the surface.
     pub(super) render_viewport: Option<RenderViewport>,
@@ -1181,6 +1185,7 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            viewport_msaa_depth: None,
             render_viewport: None,
             viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
@@ -1276,6 +1281,7 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            viewport_msaa_depth: None,
             render_viewport: None,
             viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
@@ -1350,6 +1356,7 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            viewport_msaa_depth: None,
             render_viewport: None,
             viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
