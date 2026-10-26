@@ -118,6 +118,8 @@ pub struct Window {
     pub(super) skybox: crate::renderer::Skybox,
     /// Whether the main view draws the skybox as its background (IBL is unaffected).
     pub(super) skybox_background_visible: bool,
+    /// How the skybox's diffuse IBL is evaluated (`set_diffuse_ibl`).
+    pub(super) diffuse_ibl: crate::renderer::DiffuseIbl,
     /// Screen-space ambient occlusion (created on first enable).
     pub(super) ssao: Option<crate::renderer::Ssao>,
     pub(super) ssao_enabled: bool,
@@ -672,6 +674,20 @@ impl Window {
         self.skybox_background_visible = visible;
     }
 
+    /// Selects how the skybox's diffuse image-based lighting is evaluated
+    /// (default [`DiffuseIbl::CoarsestMip`](crate::renderer::DiffuseIbl::CoarsestMip),
+    /// the original behavior). The other modes evaluate a band-4 SH projection of
+    /// the environment along the normal, with the skybox rotation and intensity.
+    /// Reflection probes and the path tracer are unaffected.
+    pub fn set_diffuse_ibl(&mut self, mode: crate::renderer::DiffuseIbl) {
+        self.diffuse_ibl = mode;
+    }
+
+    /// The diffuse IBL mode.
+    pub fn diffuse_ibl(&self) -> crate::renderer::DiffuseIbl {
+        self.diffuse_ibl
+    }
+
     /// Enables or disables screen-space ambient occlusion (SSAO).
     ///
     /// When enabled, a depth/view-position prepass plus a hemisphere-sampling
@@ -1183,6 +1199,7 @@ impl Window {
             hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             skybox_background_visible: true,
+            diffuse_ibl: crate::renderer::DiffuseIbl::CoarsestMip,
             ssao: None,
             ssao_enabled: false,
             clustered: None,
@@ -1280,6 +1297,7 @@ impl Window {
             hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             skybox_background_visible: true,
+            diffuse_ibl: crate::renderer::DiffuseIbl::CoarsestMip,
             ssao: None,
             ssao_enabled: false,
             clustered: None,
@@ -1356,6 +1374,7 @@ impl Window {
             hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             skybox_background_visible: true,
+            diffuse_ibl: crate::renderer::DiffuseIbl::CoarsestMip,
             ssao: None,
             ssao_enabled: false,
             clustered: None,

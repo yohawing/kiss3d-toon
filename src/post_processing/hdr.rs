@@ -53,6 +53,11 @@ pub enum Tonemap {
     /// Tony McMapface (Tomasz Stachowiak), sampled from its baked 3D LUT. A
     /// perceptual, hue-preserving display transform; the LUT is CC0.
     TonyMcMapface,
+    /// three.js r185's `ACESFilmicToneMapping`: exposure pre-scaled by `1/0.6`,
+    /// sRGB→AP1 (RRT_SAT) input matrix, Hill's RRT+ODT rational fit, ODT_SAT→sRGB
+    /// output matrix, clamp. Unlike [`Aces`](Self::Aces) (Narkowicz's per-channel
+    /// fit) it mixes channels.
+    AcesThree,
 }
 
 impl Tonemap {
@@ -65,6 +70,7 @@ impl Tonemap {
             Tonemap::AgX => 3,
             Tonemap::Neutral => 4,
             Tonemap::TonyMcMapface => 5,
+            Tonemap::AcesThree => 6,
         }
     }
 }

@@ -95,6 +95,10 @@ pub struct EnvLight<'a> {
     pub intensity: f32,
     /// Y-axis rotation in radians (matches the skybox).
     pub rotation: f32,
+    /// Kernel-weighted SH coefficients (bands 0..=4, RGB in `.xyz`, unrotated
+    /// environment frame) for directional diffuse IBL, or `None` to sample the
+    /// coarsest mip ([`DiffuseIbl`](crate::renderer::DiffuseIbl)).
+    pub diffuse_sh: Option<[[f32; 4]; crate::renderer::IBL_SH_COEFFS]>,
 }
 
 /// One reflection probe's placement, as supplied to materials each frame in

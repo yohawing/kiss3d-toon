@@ -477,6 +477,7 @@ impl Window {
             let env = self.skybox.ibl_env();
             let intensity = self.skybox.intensity();
             let rotation = self.skybox.rotation();
+            let diffuse_sh = env.and_then(|e| e.diffuse_sh(self.diffuse_ibl));
             MaterialManager3d::get_global_manager(|mm| {
                 mm.for_each(|mat| match env {
                     Some(env) => mat.set_environment_lighting(Some(crate::resource::EnvLight {
@@ -485,6 +486,7 @@ impl Window {
                         mip_count: env.mip_count,
                         intensity,
                         rotation,
+                        diffuse_sh,
                     })),
                     None => mat.set_environment_lighting(None),
                 });
@@ -1255,6 +1257,8 @@ impl Window {
                     mip_count: e.mip_count,
                     intensity: self.skybox.intensity(),
                     rotation: self.skybox.rotation(),
+                    // SSR only reflects (specular).
+                    diffuse_sh: None,
                 });
                 let scene_resolved = self.hdr.scene_resolved_view();
                 self.ssr.as_ref().unwrap().compute(

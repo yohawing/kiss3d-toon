@@ -5,7 +5,7 @@
 // `apply_tonemap(hdr, op)` maps a LINEAR HDR color to a gamma-encoded display
 // color. `op` matches `post_processing::Tonemap::as_u32`:
 //   0 = None (clamp), 1 = ACES, 2 = Reinhard, 3 = AgX, 4 = Khronos PBR Neutral,
-//   5 = Tony McMapface.
+//   5 = Tony McMapface, 6 = three.js ACES filmic.
 //
 // The Tony McMapface 3D LUT is declared here at group(0) bindings 6 & 7; every
 // pass that includes this file must bind the LUT + sampler there.
@@ -20,6 +20,27 @@ fn tm_aces(x: vec3<f32>) -> vec3<f32> {
     let d = 0.59;
     let e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// three.js r185 `ACESFilmicToneMapping` (tonemapping_pars_fragment), with the
+// caller's exposure already applied: the 1/0.6 pre-scale, sRGB => XYZ => D65_2_D60
+// => AP1 => RRT_SAT, Stephen Hill's RRT+ODT fit, ODT_SAT => XYZ => D60_2_D65 =>
+// sRGB, then saturate. The matrices are three's (column-major).
+fn tm_aces_three(color: vec3<f32>) -> vec3<f32> {
+    let input_mat = mat3x3<f32>(
+        vec3<f32>(0.59719, 0.07600, 0.02840),
+        vec3<f32>(0.35458, 0.90834, 0.13383),
+        vec3<f32>(0.04823, 0.01566, 0.83777),
+    );
+    let output_mat = mat3x3<f32>(
+        vec3<f32>(1.60475, -0.10208, -0.00327),
+        vec3<f32>(-0.53108, 1.10813, -0.07276),
+        vec3<f32>(-0.07367, -0.00605, 1.07602),
+    );
+    let v = input_mat * (color / 0.6);
+    let a = v * (v + 0.0245786) - 0.000090537;
+    let b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return clamp(output_mat * (a / b), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn tm_reinhard(x: vec3<f32>) -> vec3<f32> {
@@ -99,6 +120,8 @@ fn tonemap_display(hdr: vec3<f32>, op: u32) -> vec3<f32> {
         c = tm_pbr_neutral(hdr);
     } else if (op == 5u) {
         c = tm_tony(hdr);
+    } else if (op == 6u) {
+        c = tm_aces_three(hdr);
     } else {
         c = clamp(hdr, vec3<f32>(0.0), vec3<f32>(1.0));
     }

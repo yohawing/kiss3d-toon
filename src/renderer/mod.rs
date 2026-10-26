@@ -3,7 +3,7 @@
 pub use self::dof::{DepthOfFieldMode, Dof, DofSettings};
 #[cfg(feature = "egui")]
 pub use self::egui_renderer::EguiRenderer;
-pub use self::ibl::EnvironmentMap;
+pub use self::ibl::{three_pmrem_band_weights, DiffuseIbl, EnvironmentMap, IBL_SH_COEFFS};
 pub use self::point_renderer2d::PointRenderer2d;
 pub use self::point_renderer3d::PointRenderer3d;
 pub use self::polyline_renderer2d::{Polyline2d, PolylineRenderer2d};

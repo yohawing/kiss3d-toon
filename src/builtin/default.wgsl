@@ -55,7 +55,8 @@ struct FrameUniforms {
     ambient_intensity: f32,
     // 1.0: the flat ambient is additive diffuse irradiance (see `shade`).
     ambient_additive: f32,
-    _padding: f32,
+    // 1.0: diffuse IBL is evaluated from `ibl_sh` (see `ibl_sh_irradiance`).
+    ibl_diffuse_sh: f32,
     ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     // (mode, param_a, param_b, height_falloff): mode 0 off / 1 linear / 2 exp / 3 exp2.
@@ -78,6 +79,9 @@ struct FrameUniforms {
     clip_plane: vec4<f32>,
     // Fixed-size reflection-probe array (first `probe_count.x` are live).
     probes: array<Probe, MAX_PROBES>,
+    // Kernel-weighted SH coefficients of the environment (rgb; bands 0..=4,
+    // unrotated environment frame) for directional diffuse IBL.
+    ibl_sh: array<vec4<f32>, 25>,
 }
 
 // Blends `color` toward the fog color by an amount derived from the fragment's
@@ -156,6 +160,51 @@ fn ibl_rotate(rd: vec3<f32>) -> vec3<f32> {
 // Samples the environment in `dir` at the given mip LOD.
 fn ibl_sample(dir: vec3<f32>, lod: f32) -> vec3<f32> {
     return textureSampleLevel(ibl_env, ibl_samp, equirect_dir_to_uv(ibl_rotate(dir)), lod).rgb;
+}
+
+// Diffuse IBL radiance along world normal `n` from the kernel-weighted SH
+// coefficients (real orthonormal basis, bands 0..=4; must match
+// `renderer::ibl::sh_basis`), in the environment frame like `ibl_sample`.
+fn ibl_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    let d = normalize(ibl_rotate(n));
+    let x = d.x;
+    let y = d.y;
+    let z = d.z;
+    let x2 = x * x;
+    let y2 = y * y;
+    let z2 = z * z;
+    var b: array<f32, 25>;
+    b[0] = 0.2820948;
+    b[1] = 0.4886025 * y;
+    b[2] = 0.4886025 * z;
+    b[3] = 0.4886025 * x;
+    b[4] = 1.0925484 * x * y;
+    b[5] = 1.0925484 * y * z;
+    b[6] = 0.31539157 * (3.0 * z2 - 1.0);
+    b[7] = 1.0925484 * x * z;
+    b[8] = 0.5462742 * (x2 - y2);
+    b[9] = 0.5900436 * y * (3.0 * x2 - y2);
+    b[10] = 2.8906114 * x * y * z;
+    b[11] = 0.4570458 * y * (5.0 * z2 - 1.0);
+    b[12] = 0.37317633 * z * (5.0 * z2 - 3.0);
+    b[13] = 0.4570458 * x * (5.0 * z2 - 1.0);
+    b[14] = 1.4453057 * z * (x2 - y2);
+    b[15] = 0.5900436 * x * (x2 - 3.0 * y2);
+    b[16] = 2.503343 * x * y * (x2 - y2);
+    b[17] = 1.7701308 * y * z * (3.0 * x2 - y2);
+    b[18] = 0.9461747 * x * y * (7.0 * z2 - 1.0);
+    b[19] = 0.6690465 * y * z * (7.0 * z2 - 3.0);
+    b[20] = 0.10578555 * (35.0 * z2 * z2 - 30.0 * z2 + 3.0);
+    b[21] = 0.6690465 * x * z * (7.0 * z2 - 3.0);
+    b[22] = 0.47308735 * (x2 - y2) * (7.0 * z2 - 1.0);
+    b[23] = 1.7701308 * x * z * (x2 - 3.0 * y2);
+    b[24] = 0.6258357 * (x2 * x2 - 6.0 * x2 * y2 + y2 * y2);
+    var e = vec3<f32>(0.0);
+    for (var i = 0u; i < 25u; i = i + 1u) {
+        e += frame.ibl_sh[i].xyz * b[i];
+    }
+    // Band truncation can ring slightly below zero opposite a bright source.
+    return max(e, vec3<f32>(0.0));
 }
 
 // === Reflection probes ===
@@ -1335,8 +1384,9 @@ fn shade(in: VertexOutput) -> vec4<f32> {
         let nov = max(dot(N, world_v), 1e-4);
         let r_dir = reflect(-world_v, N);
         // Global environment (fallback / blend base). Diffuse irradiance ≈ coarsest
-        // mip in the normal direction; specular ≈ env at the reflection direction,
-        // mip by roughness.
+        // mip in the normal direction, or the SH irradiance along the normal when
+        // `ibl_diffuse_sh` is set; specular ≈ env at the reflection direction, mip
+        // by roughness.
         var irradiance = vec3<f32>(0.0);
         var prefiltered = vec3<f32>(0.0);
         // Clearcoat env reflection (sampled at the coat's own, typically sharper,
@@ -1347,7 +1397,11 @@ fn shade(in: VertexOutput) -> vec4<f32> {
             if frame.ibl_params.x > 0.5 {
                 let intensity = frame.ibl_params.z;
                 let max_lod = frame.ibl_params.y;
-                irradiance = ibl_sample(N, max_lod) * intensity;
+                if frame.ibl_diffuse_sh > 0.5 {
+                    irradiance = ibl_sh_irradiance(N) * intensity;
+                } else {
+                    irradiance = ibl_sample(N, max_lod) * intensity;
+                }
                 prefiltered = ibl_sample(r_dir, roughness * max_lod) * intensity;
                 @if(clearcoat) {
                     cc_prefiltered = ibl_sample(r_dir, object.clearcoat_roughness * max_lod) * intensity;
