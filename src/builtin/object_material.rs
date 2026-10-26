@@ -130,7 +130,8 @@ struct FrameUniforms {
     ambient_intensity: f32,
     // 1.0 = additive diffuse ambient (`LightCollection::additive_ambient`), else 0.0.
     ambient_additive: f32,
-    _padding: f32,
+    // 1.0 = diffuse IBL from `ibl_sh` (`EnvLight::diffuse_sh`), else the coarsest mip.
+    ibl_diffuse_sh: f32,
     // Global ambient light color (rgb); a is unused.
     ambient_color: [f32; 4],
     // Distance fog color (rgb) + max fog opacity (a).
@@ -156,6 +157,9 @@ struct FrameUniforms {
     clip_plane: [f32; 4],
     // Fixed-size reflection-probe array (only the first `probe_count.x` are live).
     probes: [GpuProbe; MAX_PROBES],
+    // Kernel-weighted diffuse IBL SH coefficients (rgb; bands 0..=4), read when
+    // `ibl_diffuse_sh` is 1.0.
+    ibl_sh: [[f32; 4]; crate::renderer::IBL_SH_COEFFS],
 }
 
 /// Object-level uniforms (transform, scale, color, PBR properties).
@@ -548,6 +552,8 @@ pub struct ObjectMaterial {
     ibl_max_lod: Cell<f32>,
     ibl_intensity: Cell<f32>,
     ibl_rotation: Cell<f32>,
+    /// Diffuse IBL SH coefficients (`EnvLight::diffuse_sh`), if any.
+    ibl_sh: Cell<Option<[[f32; 4]; crate::renderer::IBL_SH_COEFFS]>>,
     /// Whether SSAO is active this frame (gates the AO sample in the shader).
     ssao_has: Cell<bool>,
     /// Whether distance fog is active this frame (fog mode != off). Drives the `fog`
@@ -2113,6 +2119,7 @@ impl ObjectMaterial {
             ibl_max_lod: Cell::new(0.0),
             ibl_intensity: Cell::new(1.0),
             ibl_rotation: Cell::new(0.0),
+            ibl_sh: Cell::new(None),
             ssao_has: Cell::new(false),
             fog_has: Cell::new(false),
             capture_mode: Cell::new(false),
@@ -2615,7 +2622,11 @@ impl Material3d for ObjectMaterial {
                 num_lights: num_primary,
                 ambient_intensity: lights.ambient,
                 ambient_additive: if lights.additive_ambient { 1.0 } else { 0.0 },
-                _padding: 0.0,
+                ibl_diffuse_sh: if self.ibl_sh.get().is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
                 ambient_color: [
                     lights.ambient_color.r,
                     lights.ambient_color.g,
@@ -2676,6 +2687,7 @@ impl Material3d for ObjectMaterial {
                 ],
                 clip_plane: self.clip_plane.get(),
                 probes: self.probe_records.get(),
+                ibl_sh: self.ibl_sh.get().unwrap_or_default(),
             };
 
             ctxt.write_buffer(
@@ -2908,6 +2920,7 @@ impl Material3d for ObjectMaterial {
                 self.ibl_max_lod.set((e.mip_count.max(1) - 1) as f32);
                 self.ibl_intensity.set(e.intensity);
                 self.ibl_rotation.set(e.rotation);
+                self.ibl_sh.set(e.diffuse_sh);
                 // Always rebind: the env map is recreated when the skybox is (re)loaded,
                 // and a fresh `TextureView` can reuse a just-freed address, so pointer
                 // identity can't reliably detect the change (stale-view-after-realloc
@@ -2919,6 +2932,7 @@ impl Material3d for ObjectMaterial {
             }
             None => {
                 self.ibl_has.set(false);
+                self.ibl_sh.set(None);
                 // Rebind the fallback if a real env was bound (it may be dropped).
                 if self.ibl_bound_ptr != 0 {
                     self.cur_ibl_view = self.ibl_fallback_view.clone();

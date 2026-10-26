@@ -147,6 +147,7 @@ pub(super) fn tonemap_combo(ui: &mut egui::Ui, id: &str, tonemap: &mut Tonemap) 
                 Tonemap::Reinhard,
                 Tonemap::AgX,
                 Tonemap::TonyMcMapface,
+                Tonemap::AcesThree,
             ] {
                 ui.selectable_value(tonemap, t, tonemap_label(t));
             }
@@ -162,6 +163,7 @@ fn tonemap_label(t: Tonemap) -> &'static str {
         Tonemap::AgX => "AgX",
         Tonemap::Neutral => "Neutral",
         Tonemap::TonyMcMapface => "Tony McMapface",
+        Tonemap::AcesThree => "ACES (three.js)",
     }
 }
 
