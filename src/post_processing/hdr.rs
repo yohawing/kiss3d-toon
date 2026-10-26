@@ -11,7 +11,7 @@
 //!   2. MSAA is resolved into a single-sample HDR texture;
 //!   3. bloom extracts/blurs bright pixels through the mip chain;
 //!   4. the tonemap pass composites bloom, applies exposure + the tonemap
-//!      operator + gamma, and writes LDR.
+//!      operator + the output transfer (gamma 2.2 or sRGB), and writes LDR.
 //!
 //! Existing [`PostProcessingEffect`](crate::post_processing::PostProcessingEffect)s
 //! run **after** tonemapping (on the resolved LDR image), so they are unaffected
@@ -67,6 +67,17 @@ impl Tonemap {
             Tonemap::TonyMcMapface => 5,
         }
     }
+}
+
+/// Encoding of the tonemapped display color written to the (non-sRGB) output.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OutputTransfer {
+    /// `pow(c, 1/2.2)` (the default; kiss3d's historical output).
+    #[default]
+    Gamma22,
+    /// The exact piecewise sRGB OETF (IEC 61966-2-1), as three.js and browsers
+    /// encode sRGB output. Differs from `Gamma22` mostly in dark tones.
+    Srgb,
 }
 
 /// Artistic color-grading controls applied in linear HDR space, just before the
@@ -126,6 +137,9 @@ pub struct HdrSettings {
     pub auto_exposure_max: f32,
     /// Target middle-gray key value for auto-exposure (≈ 0.18).
     pub auto_exposure_key: f32,
+    /// Encoding of the rasterizer's tonemapped output. The path tracer keeps
+    /// `pow(1/2.2)`.
+    pub output_transfer: OutputTransfer,
 }
 
 impl Default for HdrSettings {
@@ -144,6 +158,7 @@ impl Default for HdrSettings {
             auto_exposure_min: 0.05,
             auto_exposure_max: 8.0,
             auto_exposure_key: 0.18,
+            output_transfer: OutputTransfer::Gamma22,
         }
     }
 }
@@ -175,6 +190,8 @@ struct TonemapUniforms {
     white_balance: [f32; 4],
     // (saturation, contrast, gamma, hue).
     grading: [f32; 4],
+    // x: output transfer (0 = pow(1/2.2), 1 = sRGB OETF); yzw unused.
+    output: [f32; 4],
 }
 
 /// Uniforms for the auto-exposure adaptation pass (`auto_exposure_adapt.wgsl`).
@@ -1583,6 +1600,15 @@ impl HdrPipeline {
                     self.settings.color_grading.contrast,
                     self.settings.color_grading.gamma,
                     self.settings.color_grading.hue,
+                ],
+                output: [
+                    match self.settings.output_transfer {
+                        OutputTransfer::Gamma22 => 0.0,
+                        OutputTransfer::Srgb => 1.0,
+                    },
+                    0.0,
+                    0.0,
+                    0.0,
                 ],
             }),
         );

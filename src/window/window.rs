@@ -11,7 +11,7 @@ use crate::camera::{Camera3d, FixedView2d};
 use crate::color::{Color, BLACK};
 use crate::context::Context;
 use crate::event::{Key, Modifiers, WindowEvent};
-use crate::post_processing::{HdrPipeline, HdrSettings, Tonemap};
+use crate::post_processing::{HdrPipeline, HdrSettings, OutputTransfer, Tonemap};
 use crate::renderer::timings::GpuTimer;
 use crate::renderer::{
     PointRenderer2d, PointRenderer3d, PolylineRenderer2d, PolylineRenderer3d, RayTracer,
@@ -956,6 +956,12 @@ impl Window {
     /// Selects the tonemapping operator used by the HDR resolve pass.
     pub fn set_tonemap(&mut self, tonemap: Tonemap) {
         self.hdr.settings_mut().tonemap = tonemap;
+    }
+
+    /// Selects how the rasterizer encodes the tonemapped color: `Gamma22`
+    /// (`pow(1/2.2)`, the default) or the exact sRGB OETF.
+    pub fn set_output_transfer(&mut self, transfer: OutputTransfer) {
+        self.hdr.settings_mut().output_transfer = transfer;
     }
 
     /// Enables or disables bloom.
