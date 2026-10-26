@@ -3328,6 +3328,11 @@ impl Material3d for ObjectMaterial {
                 let faces_guard = mesh.faces().read().unwrap();
 
                 if let (Some(coords), Some(faces)) = (coords_guard.data(), faces_guard.data()) {
+                    // Each edge once, keyed by its endpoint positions (so seams with
+                    // split vertices dedupe too): an edge shared by two triangles must
+                    // not be blended twice when the wireframe color is translucent.
+                    let key = |p: Vec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+                    let mut seen = std::collections::HashSet::with_capacity(faces.len() * 2);
                     let mut edges = Vec::with_capacity(faces.len() * 3);
                     for face in faces.iter() {
                         let idx_a = face[0] as usize;
@@ -3335,9 +3340,16 @@ impl Material3d for ObjectMaterial {
                         let idx_c = face[2] as usize;
 
                         if idx_a < coords.len() && idx_b < coords.len() && idx_c < coords.len() {
-                            edges.push((coords[idx_a], coords[idx_b]));
-                            edges.push((coords[idx_b], coords[idx_c]));
-                            edges.push((coords[idx_c], coords[idx_a]));
+                            for (a, b) in [
+                                (coords[idx_a], coords[idx_b]),
+                                (coords[idx_b], coords[idx_c]),
+                                (coords[idx_c], coords[idx_a]),
+                            ] {
+                                let (ka, kb) = (key(a), key(b));
+                                if seen.insert(if ka <= kb { (ka, kb) } else { (kb, ka) }) {
+                                    edges.push((a, b));
+                                }
+                            }
                         }
                     }
                     gpu_data.wireframe_edges = Some(edges);
