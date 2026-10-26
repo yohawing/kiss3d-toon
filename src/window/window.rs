@@ -114,6 +114,8 @@ pub struct Window {
     pub(super) hdr: HdrPipeline,
     /// Equirectangular skybox drawn as the rasterizer's scene background.
     pub(super) skybox: crate::renderer::Skybox,
+    /// Whether the main view draws the skybox as its background (IBL is unaffected).
+    pub(super) skybox_background_visible: bool,
     /// Screen-space ambient occlusion (created on first enable).
     pub(super) ssao: Option<crate::renderer::Ssao>,
     pub(super) ssao_enabled: bool,
@@ -629,6 +631,14 @@ impl Window {
         self.skybox.is_set()
     }
 
+    /// Shows or hides the skybox as the main view's background (default `true`).
+    /// Hidden, the main view shows the background color while the skybox still
+    /// provides IBL, reflection-probe and planar-reflector backgrounds, and the
+    /// path tracer environment.
+    pub fn set_skybox_background_visible(&mut self, visible: bool) {
+        self.skybox_background_visible = visible;
+    }
+
     /// Enables or disables screen-space ambient occlusion (SSAO).
     ///
     /// When enabled, a depth/view-position prepass plus a hemisphere-sampling
@@ -1131,6 +1141,7 @@ impl Window {
             egui_context: EguiContext::new(),
             hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
+            skybox_background_visible: true,
             ssao: None,
             ssao_enabled: false,
             clustered: None,
@@ -1224,6 +1235,7 @@ impl Window {
             egui_context: EguiContext::new(),
             hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
+            skybox_background_visible: true,
             ssao: None,
             ssao_enabled: false,
             clustered: None,
@@ -1296,6 +1308,7 @@ impl Window {
             egui_context: EguiContext::new(),
             hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
+            skybox_background_visible: true,
             ssao: None,
             ssao_enabled: false,
             clustered: None,
