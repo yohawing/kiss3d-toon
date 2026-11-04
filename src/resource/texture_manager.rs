@@ -205,6 +205,12 @@ impl Texture {
             (s * 255.0 + 0.5) as u8
         }
 
+        // Every input channel is one of 256 bytes. Compute the exact transfer
+        // function once, rather than twelve powf calls per output texel.
+        static SRGB_LINEAR: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+        let linear = srgb
+            .then(|| SRGB_LINEAR.get_or_init(|| std::array::from_fn(|i| srgb_to_linear(i as u8))));
+
         let new_width = (width / 2).max(1);
         let new_height = (height / 2).max(1);
         let mut new_data = vec![0u8; (new_width * new_height * 4) as usize];
@@ -227,10 +233,10 @@ impl Texture {
                         let sy = src_y + dy;
                         if sx < width as usize && sy < height as usize {
                             let idx = (sy * width as usize + sx) * 4;
-                            if srgb {
-                                r += srgb_to_linear(data[idx]);
-                                g += srgb_to_linear(data[idx + 1]);
-                                b += srgb_to_linear(data[idx + 2]);
+                            if let Some(linear) = linear {
+                                r += linear[data[idx] as usize];
+                                g += linear[data[idx + 1] as usize];
+                                b += linear[data[idx + 2] as usize];
                             } else {
                                 r += data[idx] as f32 / 255.0;
                                 g += data[idx + 1] as f32 / 255.0;
@@ -591,5 +597,25 @@ impl TextureManager {
     /// The anisotropic filtering level applied to newly loaded textures.
     pub fn anisotropy(&self) -> u16 {
         self.anisotropy
+    }
+}
+
+#[cfg(test)]
+mod mip_tests {
+    use super::Texture;
+
+    #[test]
+    fn mip_color_is_linear_light_but_alpha_and_data_are_linear_bytes() {
+        let pixels = [0, 0, 0, 0, 255, 255, 255, 255];
+        assert_eq!(
+            Texture::downsample_rgba(&pixels, 2, 1, true),
+            [188, 188, 188, 128]
+        );
+        assert_eq!(Texture::downsample_rgba(&pixels, 2, 1, false), [128; 4]);
+        // Every possible byte still round-trips exactly, including the sRGB
+        // piecewise boundary, and one-pixel-wide mip chains stay valid.
+        for byte in 0..=255 {
+            assert_eq!(Texture::downsample_rgba(&[byte; 8], 1, 2, true), [byte; 4]);
+        }
     }
 }
