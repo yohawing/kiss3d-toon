@@ -163,7 +163,7 @@ impl Bsdf {
 ///
 /// The common alpha-blending modes. The default, [`Blend`], keeps
 /// kiss3d's historical behavior: a surface is treated as transparent (and routed
-/// through the order-independent transparency pass) exactly when its color alpha
+/// through the order-independent transparency pass) when its color or base-color texture alpha
 /// is below `1.0`.
 ///
 /// [`Blend`]: AlphaMode::Blend
@@ -177,11 +177,11 @@ pub enum AlphaMode {
     /// discarded; everything else is opaque. Good for foliage and chain-link.
     Mask(f32),
     /// Standard (straight) alpha blending through the order-independent
-    /// transparency pass when alpha `< 1.0`.
+    /// transparency pass when scalar or texture alpha `< 1.0`.
     #[default]
     Blend,
     /// Premultiplied alpha blending (color is already multiplied by alpha) through
-    /// the order-independent transparency pass when alpha `< 1.0`.
+    /// the order-independent transparency pass when scalar or texture alpha `< 1.0`.
     Premultiplied,
 }
 
@@ -642,6 +642,13 @@ impl ObjectData3d {
     #[inline]
     pub fn alpha_mode(&self) -> AlphaMode {
         self.alpha_mode
+    }
+
+    /// Classify scalar and base-color texture alpha consistently for OIT.
+    pub(crate) fn is_transparent(&self) -> bool {
+        self.alpha_mode.is_transparent(self.color.a)
+            || (matches!(self.alpha_mode, AlphaMode::Blend | AlphaMode::Premultiplied)
+                && self.texture.has_transparency)
     }
 
     /// Returns this object's render-layer bitmask.
@@ -1802,7 +1809,7 @@ impl Object3d {
     /// - [`AlphaMode::Mask`] discards fragments below the cutoff (cutout).
     /// - [`AlphaMode::Blend`] (default) / [`AlphaMode::Premultiplied`] route the
     ///   surface through the order-independent transparency pass when its color
-    ///   alpha is below `1.0`.
+    ///   alpha or base-color texture alpha is below `1.0`.
     #[inline]
     pub fn set_alpha_mode(&mut self, alpha_mode: AlphaMode) {
         self.data.alpha_mode = alpha_mode;
