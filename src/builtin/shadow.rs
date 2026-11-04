@@ -1099,6 +1099,15 @@ impl ShadowMapper {
                     format: wgpu::VertexFormat::Float32x2,
                 }],
             }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x3,
+                }],
+            }),
         ];
 
         let mult_blend = wgpu::BlendComponent {
@@ -1239,6 +1248,15 @@ impl ShadowMapper {
                     offset: 0,
                     shader_location: 7,
                     format: wgpu::VertexFormat::Float32x2,
+                }],
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x3,
                 }],
             }),
         ];

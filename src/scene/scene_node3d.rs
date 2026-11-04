@@ -2170,6 +2170,12 @@ impl SceneNode3d {
         self.clone()
     }
 
+    /// Enables unlit raster shading on this node's object.
+    pub fn set_unlit(&mut self, unlit: bool) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_unlit(unlit));
+        self.clone()
+    }
+
     /// Sets the emissive color for this node's object and all its descendants.
     ///
     /// # Arguments
