@@ -31,6 +31,9 @@ pub struct Context {
     pub adapter: Arc<wgpu::Adapter>,
     /// The preferred texture format for the surface.
     pub surface_format: wgpu::TextureFormat,
+    // Device-owned: never reuse pipelines across window/context recreation.
+    pub(crate) mip_pipelines:
+        Arc<std::sync::Mutex<std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>>,
 }
 
 impl Context {
@@ -59,6 +62,7 @@ impl Context {
                 queue: Arc::new(queue),
                 adapter: Arc::new(adapter),
                 surface_format,
+                mip_pipelines: Default::default(),
             });
         });
     }
