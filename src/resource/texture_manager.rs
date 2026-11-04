@@ -69,6 +69,11 @@ impl Texture {
         } else {
             1
         };
+        let gpu_mips = mip_level_count > 1
+            && matches!(
+                format,
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+            );
 
         let texture = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("texture"),
@@ -81,7 +86,18 @@ impl Texture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | if gpu_mips {
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                } else {
+                    wgpu::TextureUsages::empty()
+                }
+                | if cfg!(test) {
+                    wgpu::TextureUsages::COPY_SRC
+                } else {
+                    wgpu::TextureUsages::empty()
+                },
             view_formats: &[],
         });
 
@@ -112,7 +128,9 @@ impl Texture {
         );
 
         // Generate and upload remaining mip levels
-        if generate_mipmaps && mip_level_count > 1 {
+        if gpu_mips {
+            Self::generate_gpu_mips(&ctxt, &texture, format, mip_level_count);
+        } else if generate_mipmaps && mip_level_count > 1 {
             // Color (sRGB) textures must be averaged in linear space; data
             // textures (normal/metallic-roughness/AO) are already linear.
             let srgb = matches!(format, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -177,6 +195,91 @@ impl Texture {
             sampler,
             size: (width, height),
         })
+    }
+
+    fn generate_gpu_mips(
+        ctxt: &Context,
+        texture: &wgpu::Texture,
+        format: wgpu::TextureFormat,
+        levels: u32,
+    ) {
+        let pipeline = ctxt
+            .mip_pipelines
+            .lock()
+            .unwrap()
+            .entry(format)
+            .or_insert_with(|| {
+                let shader = ctxt
+                    .create_shader_module(Some("texture_mip"), include_str!("texture_mip.wgsl"));
+                ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("texture_mip"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .clone();
+        let layout = pipeline.get_bind_group_layout(0);
+        let mut encoder = ctxt.create_command_encoder(Some("texture_mips"));
+        for level in 1..levels {
+            let src = texture.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: level - 1,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            let dst = texture.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            let group = ctxt.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("texture_mip"),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src),
+                }],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("texture_mip"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        ctxt.submit(std::iter::once(encoder.finish()));
     }
 
     /// Downsamples an RGBA image by half using box filtering.
@@ -603,6 +706,106 @@ impl TextureManager {
 #[cfg(test)]
 mod mip_tests {
     use super::Texture;
+
+    #[test]
+    #[ignore = "requires a GPU; reads back every generated mip and recreates the device"]
+    fn gpu_mips_match_box_filter_and_survive_context_recreation() {
+        use crate::{
+            context::Context,
+            window::{CanvasSetup, Window},
+        };
+        for _ in 0..2 {
+            let _window = pollster::block_on(Window::new_headless_with_setup(
+                16,
+                16,
+                CanvasSetup::default(),
+            ));
+            let ctxt = Context::get();
+            for srgb in [false, true] {
+                for (width, height) in [(2u32, 1u32), (1, 8), (7, 5), (16, 16), (1, 1)] {
+                    let mut expected: Vec<u8> = (0..width * height * 4)
+                        .map(|i| (i * 73 + 19) as u8)
+                        .collect();
+                    let texture = Texture::new(
+                        width,
+                        height,
+                        &expected,
+                        if srgb {
+                            wgpu::TextureFormat::Rgba8UnormSrgb
+                        } else {
+                            wgpu::TextureFormat::Rgba8Unorm
+                        },
+                        wgpu::AddressMode::Repeat,
+                        wgpu::FilterMode::Linear,
+                        true,
+                        1,
+                    );
+                    let (mut w, mut h) = (width, height);
+                    for mip in 1..texture.texture.mip_level_count() {
+                        expected = Texture::downsample_rgba(&expected, w, h, srgb);
+                        w = (w / 2).max(1);
+                        h = (h / 2).max(1);
+                        let buffer = ctxt.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("mip test"),
+                            size: u64::from(256 * h),
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                            mapped_at_creation: false,
+                        });
+                        let mut encoder = ctxt.create_command_encoder(Some("mip test"));
+                        encoder.copy_texture_to_buffer(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &texture.texture,
+                                mip_level: mip,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &buffer,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(256),
+                                    rows_per_image: Some(h),
+                                },
+                            },
+                            wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        let submission = ctxt.submit_indexed(std::iter::once(encoder.finish()));
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                            tx.send(r).unwrap();
+                        });
+                        ctxt.device
+                            .poll(wgpu::PollType::Wait {
+                                submission_index: Some(submission),
+                                timeout: None,
+                            })
+                            .unwrap();
+                        rx.recv().unwrap().unwrap();
+                        let data = buffer.slice(..).get_mapped_range().unwrap();
+                        for y in 0..h as usize {
+                            for x in 0..w as usize * 4 {
+                                // Fixed-function sRGB encoding and UNORM rounding
+                                // can differ slightly from the CPU powf oracle.
+                                assert!(
+                                    data[y * 256 + x].abs_diff(expected[y * w as usize * 4 + x])
+                                        <= 2,
+                                    "{}x{} mip {} srgb {}",
+                                    width,
+                                    height,
+                                    mip,
+                                    srgb
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn mip_color_is_linear_light_but_alpha_and_data_are_linear_bytes() {
