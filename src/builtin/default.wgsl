@@ -311,7 +311,7 @@ struct ObjectUniforms {
     reflector_normal: vec4<f32>,
     // Refractive transmission (glass) volume attenuation color (rgb); a unused.
     attenuation_color: vec4<f32>,
-    // Volume params: (thickness, attenuation_distance, unused, unused).
+    // Volume params: (thickness, attenuation_distance, unlit, unused).
     // attenuation_distance < 0 means infinite (no tint).
     volume: vec4<f32>,
 }
@@ -678,6 +678,7 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) tex_coord: vec2<f32>,
     @location(2) normal: vec3<f32>,
+    @location(8) color: vec3<f32>,
 }
 
 // === GPU vertex deformation: skinning + morph targets (deform variant only) ===
@@ -859,7 +860,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.view_pos = view_pos.xyz / view_pos.w;
 
     out.tex_coord = vertex.tex_coord;
-    out.vert_color = instance.inst_color;
+    out.vert_color = instance.inst_color * vec4<f32>(vertex.color, 1.0);
 
     return out;
 }
@@ -924,7 +925,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput, @builtin(vertex_index) 
     }
 
     out.tex_coord = vertex.tex_coord;
-    out.vert_color = instance.inst_color;
+    out.vert_color = instance.inst_color * vec4<f32>(vertex.color, 1.0);
 
     return out;
 }
@@ -1551,6 +1552,8 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     }
 
     // Distance fog (applied to the lit color; uses view distance + world height).
+    // volume.z carries the explicit unlit raster flag.
+    if object.volume.z > 0.5 { color = albedo; }
     // Present only in the `fog` variant; `apply_fog` strips away when off.
     @if(fog) color = apply_fog(color, length(in.view_pos), in.world_pos.y);
 

@@ -209,7 +209,7 @@ struct ObjectUniforms {
     // Refractive transmission (glass) volume attenuation color (rgb); a unused.
     attenuation_color: [f32; 4],
     // Refractive transmission volume params: (thickness, attenuation_distance,
-    // unused, unused). attenuation_distance < 0 means "infinite" (no tint).
+    // unlit, unused). attenuation_distance < 0 means "infinite" (no tint).
     volume: [f32; 4],
 }
 
@@ -758,7 +758,12 @@ enum PipelineKind {
 ///
 /// We use separate buffers for instance data (positions, colors, deformations)
 /// instead of interleaving them, to avoid per-frame data conversion overhead.
-fn surface_vertex_buffer_layouts() -> [Option<wgpu::VertexBufferLayout<'static>>; 6] {
+fn surface_vertex_buffer_layouts() -> [Option<wgpu::VertexBufferLayout<'static>>; 7] {
+    const COLORS: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+        offset: 0,
+        shader_location: 8,
+        format: wgpu::VertexFormat::Float32x3,
+    }];
     // Buffer 0: Vertex positions
     const POSITIONS: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
         offset: 0,
@@ -839,6 +844,11 @@ fn surface_vertex_buffer_layouts() -> [Option<wgpu::VertexBufferLayout<'static>>
             array_stride: std::mem::size_of::<[f32; 9]>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &INST_DEF,
+        }),
+        Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &COLORS,
         }),
     ]
 }
@@ -2832,7 +2842,12 @@ impl Material3d for ObjectMaterial {
                 // the shader can branch cheaply (no tint).
                 let dist = data.attenuation_distance();
                 let encoded = if dist.is_finite() { dist } else { -1.0 };
-                [data.thickness(), encoded, 0.0, 0.0]
+                [
+                    data.thickness(),
+                    encoded,
+                    if data.unlit() { 1.0 } else { 0.0 },
+                    0.0,
+                ]
             },
         };
 
@@ -3155,11 +3170,16 @@ impl Material3d for ObjectMaterial {
         mesh.uvs().write().unwrap().load_to_gpu();
         mesh.normals().write().unwrap().load_to_gpu();
         mesh.faces().write().unwrap().load_to_gpu();
+        mesh.colors().write().unwrap().load_to_gpu();
 
         let coords_buffer = mesh.coords().read().unwrap();
         let uvs_buffer = mesh.uvs().read().unwrap();
         let normals_buffer = mesh.normals().read().unwrap();
         let faces_buffer = mesh.faces().read().unwrap();
+        let colors_buffer = mesh.colors().read().unwrap();
+        let Some(colors_buf) = colors_buffer.buffer() else {
+            return;
+        };
 
         let coords_buf = match coords_buffer.buffer() {
             Some(b) => b,
@@ -3321,6 +3341,7 @@ impl Material3d for ObjectMaterial {
             render_pass.set_vertex_buffer(3, inst_positions_buf.slice(..));
             render_pass.set_vertex_buffer(4, inst_colors_buf.slice(..));
             render_pass.set_vertex_buffer(5, inst_deformations_buf.slice(..));
+            render_pass.set_vertex_buffer(6, colors_buf.slice(..));
 
             render_pass.set_index_buffer(faces_buf.slice(..), VERTEX_INDEX_FORMAT);
 

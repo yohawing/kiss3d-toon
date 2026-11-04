@@ -275,6 +275,7 @@ pub struct ObjectData3d {
     metallic: f32,
     roughness: f32,
     emissive: Color,
+    unlit: bool,
     alpha_mode: AlphaMode,
     // Path-tracer BSDF properties (ignored by the rasterizer).
     bsdf: Bsdf,
@@ -636,6 +637,11 @@ impl ObjectData3d {
     #[inline]
     pub fn emissive(&self) -> Color {
         self.emissive
+    }
+
+    /// Whether raster shading outputs the unlit base color.
+    pub fn unlit(&self) -> bool {
+        self.unlit
     }
 
     /// Returns this object's alpha blending mode.
@@ -1070,6 +1076,7 @@ impl Object3d {
             metallic: 0.0,
             roughness: 0.5,
             emissive: crate::color::BLACK,
+            unlit: false,
             alpha_mode: AlphaMode::default(),
             // Path-tracer BSDF defaults: opaque dielectric.
             bsdf: Bsdf::Opaque,
@@ -1257,6 +1264,14 @@ impl Object3d {
 
         // The transmittance pass also samples the albedo texture (UVs needed).
         let uvs_guard;
+        let colors_guard;
+        let colors_buf = if transmittance_tex.is_some() {
+            mesh.colors().write().unwrap().load_to_gpu();
+            colors_guard = mesh.colors().read().unwrap();
+            colors_guard.buffer()
+        } else {
+            None
+        };
         let uvs_buf: Option<&wgpu::Buffer> = if transmittance_tex.is_some() {
             mesh.uvs().write().unwrap().load_to_gpu();
             uvs_guard = mesh.uvs().read().unwrap();
@@ -1282,6 +1297,10 @@ impl Object3d {
             render_pass.set_bind_group(tex_group, tex_bg, &[]);
             // UV stream at slot 3 (the deformed layout has no joints/weights buffers).
             render_pass.set_vertex_buffer(3, uvs.slice(..));
+            let Some(colors) = colors_buf else {
+                return;
+            };
+            render_pass.set_vertex_buffer(4, colors.slice(..));
         }
 
         render_pass.set_vertex_buffer(0, coords_buf.slice(..));
@@ -1763,6 +1782,11 @@ impl Object3d {
     #[inline]
     pub fn set_emissive(&mut self, color: Color) {
         self.data.emissive = color;
+    }
+
+    /// Makes the rasterizer output base texture × object/vertex color, without lighting.
+    pub fn set_unlit(&mut self, unlit: bool) {
+        self.data.unlit = unlit;
     }
 
     /// Sets this object's render-layer bitmask.

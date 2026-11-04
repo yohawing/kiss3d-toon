@@ -22,6 +22,7 @@ pub struct GpuMesh3d {
     faces: Arc<RwLock<GPUVec<[VertexIndex; 3]>>>,
     normals: Arc<RwLock<GPUVec<Vec3>>>,
     uvs: Arc<RwLock<GPUVec<Vec2>>>,
+    colors: Arc<RwLock<GPUVec<Vec3>>>,
     edges: Option<Arc<RwLock<GPUVec<[VertexIndex; 2]>>>>,
     /// Optional per-vertex skinning attributes (glTF `JOINTS_0`/`WEIGHTS_0`),
     /// present only on skinned meshes. Drives GPU vertex skinning.
@@ -262,15 +263,42 @@ impl GpuMesh3d {
         normals: Arc<RwLock<GPUVec<Vec3>>>,
         uvs: Arc<RwLock<GPUVec<Vec2>>>,
     ) -> GpuMesh3d {
+        let colors = Arc::new(RwLock::new(GPUVec::new(
+            vec![Vec3::ONE; coords.read().unwrap().len()],
+            BufferType::Array,
+            AllocationType::StaticDraw,
+        )));
         GpuMesh3d {
             coords,
             faces,
             normals,
             uvs,
+            colors,
             edges: None,
             skin_vertices: None,
             morph: None,
         }
+    }
+
+    /// Sets linear RGB vertex colors multiplied by object and instance color.
+    /// Alpha remains an object/material property.
+    pub fn set_colors(&mut self, colors: Vec<Vec3>) -> Result<(), &'static str> {
+        if colors.len() != self.coords.read().unwrap().len()
+            || colors.iter().any(|c| !c.is_finite())
+        {
+            return Err("Vertex colors must be finite and match the vertex count");
+        }
+        self.colors = Arc::new(RwLock::new(GPUVec::new(
+            colors,
+            BufferType::Array,
+            AllocationType::StaticDraw,
+        )));
+        Ok(())
+    }
+
+    /// Linear RGB vertex-color stream (white when not authored).
+    pub fn colors(&self) -> &Arc<RwLock<GPUVec<Vec3>>> {
+        &self.colors
     }
 
     /// Attaches per-vertex skinning data (joint indices + weights) to this mesh,

@@ -60,6 +60,7 @@ var<uniform> model: ModelUniforms;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
+    @location(8) color: vec3<f32>,
     // The deform vertex layout places uv at @location(5); the plain one at @location(7).
     @if(!skinned) @location(7) uv: vec2<f32>,
     @if(skinned) @location(5) uv: vec2<f32>,
@@ -75,6 +76,7 @@ struct InstanceInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) color: vec3<f32>,
 }
 
 @if(!skinned)
@@ -94,6 +96,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = view.view_proj * vec4<f32>(world_pos.xyz, 1.0);
     out.uv = vertex.uv;
+    out.color = vertex.color;
     return out;
 }
 
@@ -141,6 +144,7 @@ fn vs_main(
     var out: VertexOutput;
     out.clip_position = view.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = vertex.uv;
+    out.color = vertex.color;
     return out;
 }
 
@@ -151,7 +155,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // rgb = 1) leave light untouched (T = 1); as opacity rises the occluder dims
     // and tints the light by its color. The blend multiplies this into the
     // accumulated transmittance.
-    let albedo = model.color.rgb * textureSample(t_albedo, s_albedo, in.uv).rgb;
+    let albedo = model.color.rgb * in.color * textureSample(t_albedo, s_albedo, in.uv).rgb;
     let a = model.color.a;
     let t = vec3<f32>(1.0) - a * (vec3<f32>(1.0) - albedo);
     return vec4<f32>(t, 1.0);
