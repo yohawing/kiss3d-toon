@@ -2670,7 +2670,7 @@ impl SceneNode3d {
 
     /// Whether any surface in this subtree renders in the transparent (OIT) pass,
     /// using the same classification the material applies per object
-    /// ([`AlphaMode::is_transparent`] on the object color). Lets the renderer skip
+    /// (object color and base-color texture alpha). Lets the renderer skip
     /// the OIT geometry + composite passes entirely for fully-opaque scenes — the
     /// common case — which would otherwise clear, resolve and composite the MSAA
     /// transparency targets every frame for nothing.
@@ -2678,7 +2678,7 @@ impl SceneNode3d {
         let mut any = false;
         self.apply_to_objects_recursive(&mut |obj| {
             let d = obj.data();
-            if d.surface_rendering_active() && d.alpha_mode().is_transparent(d.color().a) {
+            if d.surface_rendering_active() && d.is_transparent() {
                 any = true;
             }
         });

@@ -3107,11 +3107,10 @@ impl Material3d for ObjectMaterial {
         }
 
         // Order-independent transparency phase split: opaque surfaces (and all
-        // wireframe/point overlays) draw in the opaque phase; surfaces whose color
-        // is translucent draw in the OIT transparent phase. Transparency is keyed
-        // off the object color's alpha (per-instance alpha uses this classification
-        // too).
-        let transparent = data.alpha_mode().is_transparent(data.color().a);
+        // wireframe/point overlays) draw in the opaque phase; scalar or base-color
+        // texture transparency routes blended surfaces to the OIT phase.
+        // Per-instance alpha uses this object classification too.
+        let transparent = data.is_transparent();
         // Refractive glass draws in its own post-resolve pass (so it can sample the
         // scene behind it), not the opaque/prepass passes — otherwise it would be
         // drawn opaque and double-rendered.

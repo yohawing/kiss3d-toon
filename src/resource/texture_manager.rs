@@ -41,6 +41,8 @@ pub struct Texture {
     pub sampler: wgpu::Sampler,
     /// Texture dimensions (width, height).
     pub size: (u32, u32),
+    /// Whether uploaded RGBA8 texels contain alpha below one.
+    pub has_transparency: bool,
 }
 
 impl Texture {
@@ -194,6 +196,10 @@ impl Texture {
             view,
             sampler,
             size: (width, height),
+            has_transparency: matches!(
+                format,
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+            ) && data.chunks_exact(4).any(|p| p[3] < 255),
         })
     }
 
@@ -706,6 +712,45 @@ impl TextureManager {
 #[cfg(test)]
 mod mip_tests {
     use super::Texture;
+
+    #[test]
+    #[ignore = "requires a GPU texture"]
+    fn texture_alpha_routes_only_blended_surfaces_to_oit() {
+        use crate::{
+            scene::{AlphaMode, SceneNode3d},
+            window::Window,
+        };
+        let _window =
+            pollster::block_on(Window::new_headless_with_setup(16, 16, Default::default()));
+        let mut scene = SceneNode3d::empty();
+        let mut node = scene.add_cube(1., 1., 1.);
+        for alpha in [255, 127] {
+            let texture = Texture::new(
+                1,
+                1,
+                &[255, 255, 255, alpha],
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::AddressMode::Repeat,
+                wgpu::FilterMode::Linear,
+                false,
+                1,
+            );
+            assert_eq!(texture.has_transparency, alpha < 255);
+            node.set_texture(texture);
+            for mode in [
+                AlphaMode::Opaque,
+                AlphaMode::Mask(0.5),
+                AlphaMode::Blend,
+                AlphaMode::Premultiplied,
+            ] {
+                node.set_alpha_mode(mode);
+                assert_eq!(
+                    scene.has_transparent_surfaces(),
+                    alpha < 255 && matches!(mode, AlphaMode::Blend | AlphaMode::Premultiplied)
+                );
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires a GPU; reads back every generated mip and recreates the device"]
