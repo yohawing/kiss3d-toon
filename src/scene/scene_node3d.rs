@@ -2538,6 +2538,16 @@ impl SceneNode3d {
         self.apply_to_object_mut(&mut |o| o.clear_emissive_map());
         self.clone()
     }
+    /// Sets the raster dielectric specular-tint map on this node.
+    pub fn set_specular_tint_map(&mut self, texture: Arc<Texture>) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_specular_tint_map(texture.clone()));
+        self.clone()
+    }
+    /// Removes the raster dielectric specular-tint map from this node.
+    pub fn clear_specular_tint_map(&mut self) -> Self {
+        self.apply_to_object_mut(&mut |o| o.clear_specular_tint_map());
+        self.clone()
+    }
 
     /// Clears the emissive map for this node's object and all its descendants.
     ///

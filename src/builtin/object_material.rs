@@ -292,6 +292,7 @@ pub struct ObjectMaterialGpuData {
     cached_metallic_roughness_map_ptr: usize,
     cached_ao_map_ptr: usize,
     cached_emissive_map_ptr: usize,
+    cached_specular_tint_map_ptr: usize,
     cached_height_map_ptr: usize,
     /// Reflection texture view bound last (the reflector target, or fallback during
     /// capture / when not a reflector). Detects when the bind group must rebuild.
@@ -372,6 +373,7 @@ impl ObjectMaterialGpuData {
             cached_metallic_roughness_map_ptr: 0,
             cached_ao_map_ptr: 0,
             cached_emissive_map_ptr: 0,
+            cached_specular_tint_map_ptr: 0,
             cached_height_map_ptr: 0,
             cached_reflection_ptr: 0,
             cached_reflection_gen: 0,
@@ -673,10 +675,11 @@ impl ShaderFeatures {
     const ANISOTROPY: u32 = 1 << 13;
     const TRANSMISSION: u32 = 1 << 14;
     const REFLECTOR: u32 = 1 << 15;
+    const SPECULAR_TINT_MAP: u32 = 1 << 16;
 
     /// `(WESL feature name, bit)` — names MUST match the `@if(...)` flags in
     /// `default.wgsl`.
-    const TABLE: [(&'static str, u32); 16] = [
+    const TABLE: [(&'static str, u32); 17] = [
         ("deform", Self::DEFORM),
         ("clustered", Self::CLUSTERED),
         ("shadows", Self::SHADOWS),
@@ -693,6 +696,7 @@ impl ShaderFeatures {
         ("anisotropy", Self::ANISOTROPY),
         ("transmission", Self::TRANSMISSION),
         ("reflector", Self::REFLECTOR),
+        ("specular_tint_map", Self::SPECULAR_TINT_MAP),
     ];
 
     #[inline]
@@ -1182,15 +1186,10 @@ impl ObjectMaterial {
                 }],
             });
 
-        // Material-texture bind group layout (group 2): albedo + the four PBR maps
-        // (normal, metallic-roughness, ao, emissive), each a texture+sampler pair.
-        // Albedo and the PBR maps share one group so the pipeline uses only 4 bind
-        // groups total, within WebGPU's `maxBindGroups` limit of 4. Bindings:
-        // 0/1 albedo, 2/3 normal, 4/5 metallic-roughness, 6/7 ao, 8/9 emissive.
-        // 7 texture+sampler pairs (bindings 0..13): albedo(0/1), normal(2/3),
-        // metallic-roughness(4/5), ao(6/7), emissive(8/9), height(10/11), and the
-        // per-object planar-reflection texture(12/13).
-        let texture_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..7u32)
+        // Material textures share group 2, keeping the pipeline within four groups.
+        // Eight texture/sampler pairs: albedo(0/1), normal(2/3), MR(4/5), AO(6/7),
+        // emissive(8/9), height(10/11), planar reflection(12/13), specular tint(14/15).
+        let texture_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..8u32)
             .flat_map(|i| {
                 [
                     wgpu::BindGroupLayoutEntry {
@@ -2292,6 +2291,10 @@ impl ObjectMaterial {
             )
             .with(ShaderFeatures::AO_MAP, data.ao_map().is_some())
             .with(ShaderFeatures::EMISSIVE_MAP, data.emissive_map().is_some())
+            .with(
+                ShaderFeatures::SPECULAR_TINT_MAP,
+                data.specular_tint_map().is_some(),
+            )
             .with(ShaderFeatures::PARALLAX, data.height_map().is_some())
             .with(ShaderFeatures::CLEARCOAT, data.clearcoat() > 0.0)
             .with(ShaderFeatures::ANISOTROPY, data.anisotropy() != 0.0)
@@ -2299,8 +2302,6 @@ impl ObjectMaterial {
             .with(ShaderFeatures::REFLECTOR, data.reflector().is_some())
     }
 
-    /// Builds the combined material-texture bind group (group 2): albedo at
-    /// bindings 0/1 followed by the four PBR maps at 2/3, 4/5, 6/7, 8/9.
     /// Rebuilds the shared frame bind group (group 0) from the current per-view
     /// resources: the frame uniform, the IBL environment, and the SSAO texture.
     /// Invalidates the cached group-0 (view + shadow) bind group so it is rebuilt on
@@ -2427,6 +2428,7 @@ impl ObjectMaterial {
         emissive_map: &Texture,
         height_map: &Texture,
         reflection_view: &wgpu::TextureView,
+        specular_tint_map: &Texture,
     ) -> wgpu::BindGroup {
         let ctxt = Context::get();
         let textures = [
@@ -2464,6 +2466,14 @@ impl ObjectMaterial {
         entries.push(wgpu::BindGroupEntry {
             binding: 13,
             resource: wgpu::BindingResource::Sampler(&self.reflection_sampler),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 14,
+            resource: wgpu::BindingResource::TextureView(&specular_tint_map.view),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 15,
+            resource: wgpu::BindingResource::Sampler(&specular_tint_map.sampler),
         });
         ctxt.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("object_material_texture_bind_group"),
@@ -3222,6 +3232,8 @@ impl Material3d for ObjectMaterial {
         let ao_map = data.ao_map().unwrap_or(&self.default_ao_map);
         let emissive_map = data.emissive_map().unwrap_or(&self.default_emissive_map);
         let height_map = data.height_map().unwrap_or(&self.default_height_map);
+        let specular_tint_map = data.specular_tint_map().unwrap_or(&self.default_ao_map);
+        let specular_ptr = std::sync::Arc::as_ptr(specular_tint_map) as usize;
 
         let normal_ptr = std::sync::Arc::as_ptr(normal_map) as usize;
         let mr_ptr = std::sync::Arc::as_ptr(metallic_roughness_map) as usize;
@@ -3251,6 +3263,7 @@ impl Material3d for ObjectMaterial {
             || gpu_data.cached_metallic_roughness_map_ptr != mr_ptr
             || gpu_data.cached_ao_map_ptr != ao_ptr
             || gpu_data.cached_emissive_map_ptr != emissive_ptr
+            || gpu_data.cached_specular_tint_map_ptr != specular_ptr
             || gpu_data.cached_height_map_ptr != height_ptr
             || gpu_data.cached_reflection_ptr != reflection_ptr
             || gpu_data.cached_reflection_gen != reflection_gen;
@@ -3264,12 +3277,14 @@ impl Material3d for ObjectMaterial {
                 emissive_map,
                 height_map,
                 reflection_view,
+                specular_tint_map,
             ));
             gpu_data.cached_texture_ptr = texture_ptr;
             gpu_data.cached_normal_map_ptr = normal_ptr;
             gpu_data.cached_metallic_roughness_map_ptr = mr_ptr;
             gpu_data.cached_ao_map_ptr = ao_ptr;
             gpu_data.cached_emissive_map_ptr = emissive_ptr;
+            gpu_data.cached_specular_tint_map_ptr = specular_ptr;
             gpu_data.cached_height_map_ptr = height_ptr;
             gpu_data.cached_reflection_ptr = reflection_ptr;
             gpu_data.cached_reflection_gen = reflection_gen;

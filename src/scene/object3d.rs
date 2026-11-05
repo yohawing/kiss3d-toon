@@ -310,6 +310,7 @@ pub struct ObjectData3d {
     metallic_roughness_map: Option<Arc<Texture>>,
     ao_map: Option<Arc<Texture>>,
     emissive_map: Option<Arc<Texture>>,
+    specular_tint_map: Option<Arc<Texture>>,
     /// Height/displacement map for parallax mapping (grayscale; brighter = higher).
     height_map: Option<Arc<Texture>>,
     /// Parallax displacement scale (surface depth in UV units). `0` disables it.
@@ -800,6 +801,10 @@ impl ObjectData3d {
     pub fn emissive_map(&self) -> Option<&Arc<Texture>> {
         self.emissive_map.as_ref()
     }
+    /// Linear RGB multiplier of dielectric specular tint (raster renderer).
+    pub fn specular_tint_map(&self) -> Option<&Arc<Texture>> {
+        self.specular_tint_map.as_ref()
+    }
 
     /// Returns a reference to this object's height/displacement map (parallax).
     #[inline]
@@ -1084,6 +1089,7 @@ impl Object3d {
             metallic_roughness_map: None,
             ao_map: None,
             emissive_map: None,
+            specular_tint_map: None,
             height_map: None,
             parallax_scale: 0.1,
             parallax_layers: 16.0,
@@ -2024,6 +2030,14 @@ impl Object3d {
     #[inline]
     pub fn clear_emissive_map(&mut self) {
         self.data.emissive_map = None;
+    }
+    /// Sets a linear RGB specular-tint map for the raster renderer.
+    pub fn set_specular_tint_map(&mut self, texture: Arc<Texture>) {
+        self.data.specular_tint_map = Some(texture);
+    }
+    /// Removes the raster specular-tint map.
+    pub fn clear_specular_tint_map(&mut self) {
+        self.data.specular_tint_map = None;
     }
 
     /// Sets the height/displacement map used for parallax mapping from a file.
