@@ -352,6 +352,10 @@ var s_height: sampler;
 var t_reflection: texture_2d<f32>;
 @group(2) @binding(13)
 var s_reflection: sampler;
+@group(2) @binding(14)
+var t_specular_tint: texture_2d<f32>;
+@group(2) @binding(15)
+var s_specular_tint: sampler;
 
 // === SHADOW MAPPING (group 3) — localized block for easy merging ===
 // Maximum number of atlas views (must match builtin/shadow.rs MAX_SHADOW_VIEWS).
@@ -1263,7 +1267,11 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // Reflectance at normal incidence (F0). Dielectrics use the reflectance
     // remap `0.16·reflectance²` (0.04 at the default 0.5) tinted by specular_tint;
     // metals use the albedo.
-    let dielectric_f0 = 0.16 * object.reflectance * object.reflectance * object.specular_tint.rgb;
+    var specular_tint = object.specular_tint.rgb;
+    @if(specular_tint_map) {
+        specular_tint *= textureSample(t_specular_tint, s_specular_tint, uv).rgb;
+    }
+    let dielectric_f0 = 0.16 * object.reflectance * object.reflectance * specular_tint;
     let F0 = mix(dielectric_f0, albedo, metallic);
 
     // Anisotropy basis: a UV-aligned tangent (from the cotangent frame, so it is
