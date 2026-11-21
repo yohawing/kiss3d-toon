@@ -318,7 +318,8 @@ pub struct ObjectMaterialGpuData {
     cached_reflection_gen: u64,
     // Wireframe rendering data (model uniforms are per-object)
     wireframe_model_uniform_buffer: wgpu::Buffer,
-    wireframe_edge_buffer: wgpu::Buffer,
+    /// Edge storage buffer, created on the first wireframe draw of this object.
+    wireframe_edge_buffer: Option<wgpu::Buffer>,
     wireframe_edge_capacity: usize,
     wireframe_model_bind_group: Option<wgpu::BindGroup>,
     /// Cached wireframe edges in local coordinates (built lazily from mesh).
@@ -329,7 +330,8 @@ pub struct ObjectMaterialGpuData {
     wireframe_model_uniforms: WireframeModelUniforms,
     // Point rendering data (model uniforms are per-object)
     points_model_uniform_buffer: wgpu::Buffer,
-    points_vertex_buffer: wgpu::Buffer,
+    /// Vertex storage buffer, created on the first point draw of this object.
+    points_vertex_buffer: Option<wgpu::Buffer>,
     points_vertex_capacity: usize,
     points_model_bind_group: Option<wgpu::BindGroup>,
     /// Cached vertices for point rendering (built lazily from mesh).
@@ -339,6 +341,10 @@ pub struct ObjectMaterialGpuData {
     /// Cached points model uniforms (written during prepare).
     points_model_uniforms: PointsModelUniforms,
 }
+
+/// Initial element capacity of the per-object wireframe edge and point vertex
+/// storage buffers (created on first use, grown to the next power of two).
+const INITIAL_GPU_DATA_CAPACITY: usize = 1024;
 
 impl ObjectMaterialGpuData {
     /// Creates new per-object GPU data.
@@ -353,29 +359,11 @@ impl ObjectMaterialGpuData {
             mapped_at_creation: false,
         });
 
-        // Initial edge storage buffer (will grow as needed)
-        let wireframe_edge_capacity = 1024;
-        let wireframe_edge_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wireframe_edge_buffer"),
-            size: (std::mem::size_of::<GpuEdge>() * wireframe_edge_capacity) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         // Point model uniform buffer (per-object)
         let points_model_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("points_model_uniform_buffer"),
             size: std::mem::size_of::<PointsModelUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Initial vertex storage buffer for points (will grow as needed)
-        let points_vertex_capacity = 1024;
-        let points_vertex_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("points_vertex_buffer"),
-            size: (std::mem::size_of::<GpuVertex>() * points_vertex_capacity) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -394,8 +382,8 @@ impl ObjectMaterialGpuData {
             cached_reflection_gen: 0,
             // Wireframe rendering
             wireframe_model_uniform_buffer,
-            wireframe_edge_buffer,
-            wireframe_edge_capacity,
+            wireframe_edge_buffer: None,
+            wireframe_edge_capacity: 0,
             wireframe_model_bind_group: None,
             wireframe_edges: None,
             wireframe_edges_mesh_hash: 0,
@@ -409,8 +397,8 @@ impl ObjectMaterialGpuData {
                 _padding: [0.0; 2],
             },
             points_model_uniform_buffer,
-            points_vertex_buffer,
-            points_vertex_capacity,
+            points_vertex_buffer: None,
+            points_vertex_capacity: 0,
             points_model_bind_group: None,
             points_vertices: None,
             points_vertices_mesh_hash: 0,
@@ -426,38 +414,42 @@ impl ObjectMaterialGpuData {
         }
     }
 
-    /// Ensures the edge buffer has enough capacity, growing if needed.
-    fn ensure_edge_buffer_capacity(&mut self, needed: usize) {
-        if needed > self.wireframe_edge_capacity {
+    /// Ensures the edge buffer exists with enough capacity, creating or growing it
+    /// if needed, and returns it.
+    fn ensure_edge_buffer_capacity(&mut self, needed: usize) -> &wgpu::Buffer {
+        if self.wireframe_edge_buffer.is_none() || needed > self.wireframe_edge_capacity {
             let ctxt = Context::get();
-            let new_capacity = needed.next_power_of_two();
-            self.wireframe_edge_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
+            let new_capacity = needed.next_power_of_two().max(INITIAL_GPU_DATA_CAPACITY);
+            self.wireframe_edge_buffer = Some(ctxt.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("wireframe_edge_buffer"),
                 size: (std::mem::size_of::<GpuEdge>() * new_capacity) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            });
+            }));
             self.wireframe_edge_capacity = new_capacity;
             // Invalidate bind group since buffer changed
             self.wireframe_model_bind_group = None;
         }
+        self.wireframe_edge_buffer.as_ref().unwrap()
     }
 
-    /// Ensures the vertex buffer for points has enough capacity, growing if needed.
-    fn ensure_vertex_buffer_capacity(&mut self, needed: usize) {
-        if needed > self.points_vertex_capacity {
+    /// Ensures the vertex buffer for points exists with enough capacity, creating
+    /// or growing it if needed, and returns it.
+    fn ensure_vertex_buffer_capacity(&mut self, needed: usize) -> &wgpu::Buffer {
+        if self.points_vertex_buffer.is_none() || needed > self.points_vertex_capacity {
             let ctxt = Context::get();
-            let new_capacity = needed.next_power_of_two();
-            self.points_vertex_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
+            let new_capacity = needed.next_power_of_two().max(INITIAL_GPU_DATA_CAPACITY);
+            self.points_vertex_buffer = Some(ctxt.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("points_vertex_buffer"),
                 size: (std::mem::size_of::<GpuVertex>() * new_capacity) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            });
+            }));
             self.points_vertex_capacity = new_capacity;
             // Invalidate bind group since buffer changed
             self.points_model_bind_group = None;
         }
+        self.points_vertex_buffer.as_ref().unwrap()
     }
 }
 
@@ -3461,13 +3453,9 @@ impl Material3d for ObjectMaterial {
                 };
 
                 // Ensure edge buffer capacity and upload edges (geometry data)
-                gpu_data.ensure_edge_buffer_capacity(num_edges);
+                let edge_buffer = gpu_data.ensure_edge_buffer_capacity(num_edges);
 
-                ctxt.write_buffer(
-                    &gpu_data.wireframe_edge_buffer,
-                    0,
-                    bytemuck::cast_slice(&gpu_edges),
-                );
+                ctxt.write_buffer(edge_buffer, 0, bytemuck::cast_slice(&gpu_edges));
 
                 // Update num_edges in model uniforms if it changed from prepare()
                 if gpu_data.wireframe_model_uniforms.num_edges != num_edges as u32 {
@@ -3482,12 +3470,16 @@ impl Material3d for ObjectMaterial {
                 // Get or create wireframe model bind group (view bind group is shared)
                 if gpu_data.wireframe_model_bind_group.is_none() {
                     let edge_size = (num_edges * std::mem::size_of::<GpuEdge>()) as u64;
-                    gpu_data.wireframe_model_bind_group =
-                        Some(self.create_wireframe_model_bind_group(
+                    gpu_data.wireframe_model_bind_group = Some(
+                        self.create_wireframe_model_bind_group(
                             &gpu_data.wireframe_model_uniform_buffer,
-                            &gpu_data.wireframe_edge_buffer,
+                            gpu_data
+                                .wireframe_edge_buffer
+                                .as_ref()
+                                .expect("edge buffer was just ensured"),
                             edge_size,
-                        ));
+                        ),
+                    );
                 }
 
                 let wireframe_model_bind_group =
@@ -3574,13 +3566,9 @@ impl Material3d for ObjectMaterial {
                 };
 
                 // Ensure vertex buffer capacity and upload vertices (geometry data)
-                gpu_data.ensure_vertex_buffer_capacity(num_vertices);
+                let vertex_buffer = gpu_data.ensure_vertex_buffer_capacity(num_vertices);
 
-                ctxt.write_buffer(
-                    &gpu_data.points_vertex_buffer,
-                    0,
-                    bytemuck::cast_slice(&gpu_vertices),
-                );
+                ctxt.write_buffer(vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
 
                 // Update num_vertices in model uniforms if it changed from prepare()
                 if gpu_data.points_model_uniforms.num_vertices != num_vertices as u32 {
@@ -3595,11 +3583,16 @@ impl Material3d for ObjectMaterial {
                 // Get or create points model bind group (view bind group is shared)
                 if gpu_data.points_model_bind_group.is_none() {
                     let vertex_size = (num_vertices * std::mem::size_of::<GpuVertex>()) as u64;
-                    gpu_data.points_model_bind_group = Some(self.create_points_model_bind_group(
-                        &gpu_data.points_model_uniform_buffer,
-                        &gpu_data.points_vertex_buffer,
-                        vertex_size,
-                    ));
+                    gpu_data.points_model_bind_group = Some(
+                        self.create_points_model_bind_group(
+                            &gpu_data.points_model_uniform_buffer,
+                            gpu_data
+                                .points_vertex_buffer
+                                .as_ref()
+                                .expect("vertex buffer was just ensured"),
+                            vertex_size,
+                        ),
+                    );
                 }
 
                 let points_model_bind_group = gpu_data.points_model_bind_group.as_ref().unwrap();

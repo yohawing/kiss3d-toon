@@ -37,4 +37,12 @@ pub trait PostProcessingEffect {
     /// * `target` - The render target containing the rendered scene (color and depth textures)
     /// * `context` - The post-processing context with encoder and output view
     fn draw(&mut self, target: &RenderTarget, context: &mut PostProcessingContext);
+
+    /// Whether this effect reads the input render target's depth texture.
+    ///
+    /// Color-only effects leave this `false` (the default) so ping-pong render
+    /// targets skip allocating an unused depth buffer.
+    fn needs_depth(&self) -> bool {
+        false
+    }
 }

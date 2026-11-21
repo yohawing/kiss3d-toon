@@ -16,10 +16,10 @@ pub struct OffscreenBuffers {
     pub color_texture: wgpu::Texture,
     /// The color texture view.
     pub color_view: wgpu::TextureView,
-    /// The depth texture.
-    pub depth_texture: wgpu::Texture,
-    /// The depth texture view.
-    pub depth_view: wgpu::TextureView,
+    /// The depth texture (present only when created with `create_depth_texture = true`).
+    pub depth_texture: Option<wgpu::Texture>,
+    /// The depth texture view (present only when created with `create_depth_texture = true`).
+    pub depth_view: Option<wgpu::TextureView>,
     /// The sampler for the color texture (for post-processing).
     pub sampler: wgpu::Sampler,
     /// Width of the render target.
@@ -41,11 +41,11 @@ impl RenderTarget {
 
     /// Returns the depth texture view for off-screen rendering.
     ///
-    /// Returns `None` if this is the screen target.
+    /// Returns `None` if this is the screen target or was created without a depth texture.
     pub fn depth_view(&self) -> Option<&wgpu::TextureView> {
         match self {
             RenderTarget::Screen => None,
-            RenderTarget::Offscreen(o) => Some(&o.depth_view),
+            RenderTarget::Offscreen(o) => o.depth_view.as_ref(),
         }
     }
 
@@ -69,17 +69,44 @@ impl RenderTarget {
         }
     }
 
-    /// Resizes this render target.
+    /// Resizes this render target, preserving whether it has a depth texture.
     pub fn resize(&mut self, width: u32, height: u32, surface_format: wgpu::TextureFormat) {
         match self {
             RenderTarget::Screen => {
                 // Screen resizing is handled by the canvas/surface
             }
             RenderTarget::Offscreen(o) => {
+                let width = width.max(1);
+                let height = height.max(1);
                 if o.width != width || o.height != height {
+                    let has_depth = o.depth_texture.is_some();
                     // Recreate textures with new size
-                    **o = OffscreenBuffers::new(width, height, surface_format, true);
+                    **o = OffscreenBuffers::new(width, height, surface_format, has_depth);
                 }
+            }
+        }
+    }
+
+    /// Resizes this render target and ensures it has a depth texture when
+    /// `needs_depth` is set.
+    ///
+    /// A size change recreates the target with a depth texture only if
+    /// `needs_depth`. At an unchanged size, an existing depth texture is kept even
+    /// when no longer needed, so the color view stays stable for callers holding
+    /// it; a missing one is added (recreating the target) when needed.
+    pub(crate) fn resize_with_depth(
+        &mut self,
+        width: u32,
+        height: u32,
+        surface_format: wgpu::TextureFormat,
+        needs_depth: bool,
+    ) {
+        if let RenderTarget::Offscreen(o) = self {
+            let width = width.max(1);
+            let height = height.max(1);
+            if o.width != width || o.height != height || (needs_depth && o.depth_texture.is_none())
+            {
+                **o = OffscreenBuffers::new(width, height, surface_format, needs_depth);
             }
         }
     }
@@ -119,28 +146,29 @@ impl OffscreenBuffers {
 
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create depth texture
-        let depth_format = Context::depth_format();
-        let depth_texture = ctxt.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen_depth_texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: depth_format,
-            usage: if create_depth_texture {
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
-            } else {
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-            },
-            view_formats: &[],
-        });
-
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Create depth texture only when requested
+        let (depth_texture, depth_view) = if create_depth_texture {
+            let depth_format = Context::depth_format();
+            let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
+                label: Some("offscreen_depth_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: depth_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(tex), Some(view))
+        } else {
+            (None, None)
+        };
 
         // Create sampler for the color texture
         let sampler = ctxt.create_sampler(&wgpu::SamplerDescriptor {

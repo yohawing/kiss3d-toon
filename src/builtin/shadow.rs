@@ -218,6 +218,14 @@ struct ShadowView {
     view_proj: Mat4,
 }
 
+/// Allocated 2D-array atlas texture plus per-layer render views and whole-array
+/// sampling view. Created lazily on first active shadow frame.
+struct ShadowAtlas {
+    _texture: wgpu::Texture,
+    layer_views: Vec<wgpu::TextureView>,
+    array_view: wgpu::TextureView,
+}
+
 /// Renders the scene depth from each shadow-casting light into a shared atlas
 /// and provides the resources the lighting shader binds as group 4.
 pub struct ShadowMapper {
@@ -244,22 +252,20 @@ pub struct ShadowMapper {
     /// covers `[near, this]`; larger means the crisp near cascade reaches further (so
     /// the camera needn't be as close) at the cost of some near detail.
     first_cascade_far_bound: f32,
-    /// The depth atlas texture (`Depth32Float`, 2D array).
-    atlas: wgpu::Texture,
-    /// One depth view per atlas layer, for the pre-pass render targets.
-    layer_views: Vec<wgpu::TextureView>,
-    /// Array view of the whole atlas, sampled by the lighting shader.
-    array_view: wgpu::TextureView,
+    /// 1×1×1 dummy depth atlas bound while shadows have not yet been rendered.
+    _dummy_atlas: wgpu::Texture,
+    dummy_array_view: wgpu::TextureView,
+    /// Lazily allocated depth atlas (`Depth32Float`, 2D array).
+    atlas: Option<ShadowAtlas>,
     /// Comparison sampler used for hardware PCF.
     compare_sampler: wgpu::Sampler,
-    /// Colored transmittance atlas (`Rgba8Unorm`, 2D array): per shadow texel, the
-    /// accumulated RGB transmittance of translucent occluders in front of the
-    /// nearest opaque surface. White where nothing translucent occludes.
-    transmittance_atlas: wgpu::Texture,
-    /// One color view per transmittance-atlas layer, for the transmittance pass.
-    transmittance_layer_views: Vec<wgpu::TextureView>,
-    /// Array view of the transmittance atlas, sampled by the lighting shader.
-    transmittance_array_view: wgpu::TextureView,
+    /// 1×1×1 dummy transmittance atlas bound while no translucent casters have rendered.
+    _dummy_transmittance_atlas: wgpu::Texture,
+    dummy_transmittance_array_view: wgpu::TextureView,
+    /// Lazily allocated colored transmittance atlas (`Rgba8Unorm`, 2D array): per
+    /// shadow texel, the accumulated RGB transmittance of translucent occluders
+    /// in front of the nearest opaque surface.
+    transmittance_atlas: Option<ShadowAtlas>,
     /// Filtering sampler for the transmittance atlas (bilinear).
     transmittance_sampler: wgpu::Sampler,
     /// Pipeline that rasterizes translucent casters into the transmittance atlas.
@@ -319,9 +325,9 @@ impl ShadowMapper {
         let resolution = resolution.max(1);
         let atlas_layers = atlas_layers.clamp(1, MAX_SHADOW_VIEWS as u32);
 
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, atlas_layers);
-        let (transmittance_atlas, transmittance_layer_views, transmittance_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution, atlas_layers);
+        let (dummy_atlas, dummy_array_view) = Self::create_dummy_atlas(&ctxt);
+        let (dummy_transmittance_atlas, dummy_transmittance_array_view) =
+            Self::create_dummy_transmittance_atlas(&ctxt);
 
         // Comparison sampler: hardware does the depth test and (with linear
         // filtering) bilinear PCF across the 2x2 neighborhood per tap.
@@ -361,10 +367,10 @@ impl ShadowMapper {
         let bind_group = Self::create_bind_group(
             &ctxt,
             &bind_group_layout,
-            &array_view,
+            &dummy_array_view,
             &compare_sampler,
             &uniform_buffer,
-            &transmittance_array_view,
+            &dummy_transmittance_array_view,
             &transmittance_sampler,
         );
 
@@ -527,13 +533,13 @@ impl ShadowMapper {
             num_cascades: 4,
             shadow_distance: f32::INFINITY,
             first_cascade_far_bound: 12.0,
-            atlas,
-            layer_views,
-            array_view,
+            _dummy_atlas: dummy_atlas,
+            dummy_array_view,
+            atlas: None,
             compare_sampler,
-            transmittance_atlas,
-            transmittance_layer_views,
-            transmittance_array_view,
+            _dummy_transmittance_atlas: dummy_transmittance_atlas,
+            dummy_transmittance_array_view,
+            transmittance_atlas: None,
             transmittance_sampler,
             transmittance_pipeline,
             transmittance_tex_bgl,
@@ -676,11 +682,53 @@ impl ShadowMapper {
         }
     }
 
-    fn create_atlas(
-        ctxt: &Context,
-        resolution: u32,
-        layers: u32,
-    ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
+    fn create_dummy_atlas(ctxt: &Context) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow_dummy_atlas"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow_dummy_atlas_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        (tex, view)
+    }
+
+    fn create_dummy_transmittance_atlas(ctxt: &Context) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow_dummy_transmittance_atlas"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TRANSMITTANCE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow_dummy_transmittance_atlas_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        (tex, view)
+    }
+
+    fn create_atlas(ctxt: &Context, resolution: u32, layers: u32) -> ShadowAtlas {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_atlas"),
             size: wgpu::Extent3d {
@@ -714,17 +762,17 @@ impl ShadowMapper {
             ..Default::default()
         });
 
-        (atlas, layer_views, array_view)
+        ShadowAtlas {
+            _texture: atlas,
+            layer_views,
+            array_view,
+        }
     }
 
     /// Creates the colored transmittance atlas (color counterpart of the depth
     /// atlas), returning the texture, one render view per layer, and the array
     /// view sampled by the lighting shader.
-    fn create_transmittance_atlas(
-        ctxt: &Context,
-        resolution: u32,
-        layers: u32,
-    ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
+    fn create_transmittance_atlas(ctxt: &Context, resolution: u32, layers: u32) -> ShadowAtlas {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_transmittance_atlas"),
             size: wgpu::Extent3d {
@@ -758,7 +806,11 @@ impl ShadowMapper {
             ..Default::default()
         });
 
-        (atlas, layer_views, array_view)
+        ShadowAtlas {
+            _texture: atlas,
+            layer_views,
+            array_view,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1338,14 +1390,63 @@ impl ShadowMapper {
         &self.bind_group
     }
 
+    fn active_array_view(&self) -> &wgpu::TextureView {
+        self.atlas
+            .as_ref()
+            .map_or(&self.dummy_array_view, |a| &a.array_view)
+    }
+
+    fn active_transmittance_view(&self) -> &wgpu::TextureView {
+        self.transmittance_atlas
+            .as_ref()
+            .map_or(&self.dummy_transmittance_array_view, |a| &a.array_view)
+    }
+
+    fn rebuild_bind_group(&mut self) {
+        let ctxt = Context::get();
+        self.bind_group = Self::create_bind_group(
+            &ctxt,
+            &self.bind_group_layout,
+            self.active_array_view(),
+            &self.compare_sampler,
+            &self.uniform_buffer,
+            self.active_transmittance_view(),
+            &self.transmittance_sampler,
+        );
+    }
+
+    fn ensure_atlas(&mut self) {
+        if self.atlas.is_none() {
+            let ctxt = Context::get();
+            self.atlas = Some(Self::create_atlas(
+                &ctxt,
+                self.resolution,
+                self.atlas_layers,
+            ));
+            self.rebuild_bind_group();
+        }
+    }
+
+    fn ensure_transmittance_atlas(&mut self) {
+        if self.transmittance_atlas.is_none() {
+            let ctxt = Context::get();
+            self.transmittance_atlas = Some(Self::create_transmittance_atlas(
+                &ctxt,
+                self.resolution,
+                self.atlas_layers,
+            ));
+            self.rebuild_bind_group();
+        }
+    }
+
     /// The shadow GPU resources, for the object material to fold into its view
     /// (group 0) bind group. Cloning these handles is cheap (reference-counted).
     pub fn resources(&self) -> crate::resource::ShadowResources {
         crate::resource::ShadowResources {
-            atlas: self.array_view.clone(),
+            atlas: self.active_array_view().clone(),
             compare_sampler: self.compare_sampler.clone(),
             uniform: self.uniform_buffer.clone(),
-            transmittance: self.transmittance_array_view.clone(),
+            transmittance: self.active_transmittance_view().clone(),
             transmittance_sampler: self.transmittance_sampler.clone(),
         }
     }
@@ -1442,26 +1543,27 @@ impl ShadowMapper {
     }
 
     fn reallocate_atlases(&mut self) {
+        let mut changed = false;
         let ctxt = Context::get();
-        let (atlas, layer_views, array_view) =
-            Self::create_atlas(&ctxt, self.resolution, self.atlas_layers);
-        self.atlas = atlas;
-        self.layer_views = layer_views;
-        self.array_view = array_view;
-        let (t_atlas, t_layer_views, t_array_view) =
-            Self::create_transmittance_atlas(&ctxt, self.resolution, self.atlas_layers);
-        self.transmittance_atlas = t_atlas;
-        self.transmittance_layer_views = t_layer_views;
-        self.transmittance_array_view = t_array_view;
-        self.bind_group = Self::create_bind_group(
-            &ctxt,
-            &self.bind_group_layout,
-            &self.array_view,
-            &self.compare_sampler,
-            &self.uniform_buffer,
-            &self.transmittance_array_view,
-            &self.transmittance_sampler,
-        );
+        if self.atlas.is_some() {
+            self.atlas = Some(Self::create_atlas(
+                &ctxt,
+                self.resolution,
+                self.atlas_layers,
+            ));
+            changed = true;
+        }
+        if self.transmittance_atlas.is_some() {
+            self.transmittance_atlas = Some(Self::create_transmittance_atlas(
+                &ctxt,
+                self.resolution,
+                self.atlas_layers,
+            ));
+            changed = true;
+        }
+        if changed {
+            self.rebuild_bind_group();
+        }
     }
 
     /// Renders the shadow depth pre-pass and uploads the shadow uniforms.
@@ -1659,9 +1761,17 @@ impl ShadowMapper {
             );
         }
 
+        // Lazily allocate the shadow atlas (and transmittance atlas if any
+        // translucent caster is present) the first time a frame actually renders
+        // shadows, then keep them for subsequent frames.
+        self.ensure_atlas();
+        if has_transparent {
+            self.ensure_transmittance_atlas();
+        }
+
         // Render scene depth into each scheduled atlas layer.
         for view in &views {
-            let depth_view = &self.layer_views[view.layer as usize];
+            let depth_view = &self.atlas.as_ref().unwrap().layer_views[view.layer as usize];
             let offset = (view.layer as u64 * SHADOW_VIEW_STRIDE) as u32;
 
             // Pass 1: opaque casters write depth (the binary-visibility map).
@@ -1710,7 +1820,8 @@ impl ShadowMapper {
             // entirely when nothing translucent casts, leaving the all-opaque path
             // untouched.
             if has_transparent {
-                let transmittance_view = &self.transmittance_layer_views[view.layer as usize];
+                let transmittance_view =
+                    &self.transmittance_atlas.as_ref().unwrap().layer_views[view.layer as usize];
                 let transmittance_ts = gpu.render_scope("shadows");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shadow_transmittance_pass"),

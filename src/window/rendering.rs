@@ -378,20 +378,26 @@ impl Window {
         // attachment and resolved into the single-sample HDR texture (see
         // `resolve_view` below) before tonemapping.
         self.hdr.resize(w, h, sample_count);
-        self.post_process_render_target
-            .resize(w, h, self.canvas.surface_format());
-        self.post_process_render_target_b
-            .resize(w, h, self.canvas.surface_format());
+        // `offscreen_output_target`'s depth is only used by single-sample
+        // offscreen/partial-viewport rendering; under MSAA, depth comes from
+        // `viewport_msaa_depth` (partial viewport) or `canvas.depth_view()`
+        // (headless / full surface).
+        let offscreen_needs_depth = sample_count == 1;
         if render_offscreen {
-            if self.offscreen_output_target.is_none() {
-                self.offscreen_output_target =
-                    Some(self.framebuffer_manager.new_render_target(w, h, true));
+            match self.offscreen_output_target.as_mut() {
+                Some(target) => target.resize_with_depth(
+                    w,
+                    h,
+                    self.canvas.surface_format(),
+                    offscreen_needs_depth,
+                ),
+                None => {
+                    self.offscreen_output_target = Some(
+                        self.framebuffer_manager
+                            .new_render_target(w, h, offscreen_needs_depth),
+                    );
+                }
             }
-            self.offscreen_output_target.as_mut().unwrap().resize(
-                w,
-                h,
-                self.canvas.surface_format(),
-            );
         }
 
         let surface_view = frame.as_ref().map(|frame| {
@@ -1323,8 +1329,35 @@ impl Window {
             self.hdr
                 .resolve(&mut encoder, &frame_view, force_opaque, &mut self.gpu_timer);
         } else {
+            let needs_depth = post_processing.iter().any(|p| p.needs_depth());
+            let surface_format = self.canvas.surface_format();
+            match self.post_process_render_target.as_mut() {
+                Some(target) => target.resize_with_depth(w, h, surface_format, needs_depth),
+                None => {
+                    self.post_process_render_target = Some(
+                        self.framebuffer_manager
+                            .new_render_target(w, h, needs_depth),
+                    );
+                }
+            }
+            if post_processing.len() >= 2 {
+                match self.post_process_render_target_b.as_mut() {
+                    Some(target) => target.resize_with_depth(w, h, surface_format, needs_depth),
+                    None => {
+                        self.post_process_render_target_b = Some(
+                            self.framebuffer_manager
+                                .new_render_target(w, h, needs_depth),
+                        );
+                    }
+                }
+            }
+
             // Tonemap into the first ping-pong target (A).
-            let first_view = match &self.post_process_render_target {
+            let first_view = match self
+                .post_process_render_target
+                .as_ref()
+                .expect("post-process target A was just created")
+            {
                 RenderTarget::Offscreen(o) => o.color_view.clone(),
                 RenderTarget::Screen => frame_view.clone(),
             };
@@ -1337,17 +1370,25 @@ impl Window {
                 // final effect writes `frame_view` instead of a ping-pong target.
                 let read_a = i % 2 == 0;
                 let input = if read_a {
-                    &self.post_process_render_target
+                    self.post_process_render_target
+                        .as_ref()
+                        .expect("post-process target A was just created")
                 } else {
-                    &self.post_process_render_target_b
+                    self.post_process_render_target_b
+                        .as_ref()
+                        .expect("post-process target B was just created")
                 };
                 let output_view: &wgpu::TextureView = if i == n - 1 {
                     &frame_view
                 } else {
                     let out_target = if read_a {
-                        &self.post_process_render_target_b
+                        self.post_process_render_target_b
+                            .as_ref()
+                            .expect("post-process target B was just created")
                     } else {
-                        &self.post_process_render_target
+                        self.post_process_render_target
+                            .as_ref()
+                            .expect("post-process target A was just created")
                     };
                     match out_target {
                         RenderTarget::Offscreen(o) => &o.color_view,
@@ -1533,15 +1574,21 @@ impl Window {
         // The path tracer renders single-sampled into an offscreen color texture
         // when the window is hidden; otherwise straight into the surface.
         if offscreen {
-            if self.offscreen_output_target.is_none() {
-                self.offscreen_output_target =
-                    Some(self.framebuffer_manager.new_render_target(w, h, true));
+            // The path tracer needs no depth; give the target the depth the
+            // single-sample rasterizer would need so switching back to it does
+            // not replace the output view.
+            let needs_depth = self.canvas.sample_count() == 1;
+            match self.offscreen_output_target.as_mut() {
+                Some(target) => {
+                    target.resize_with_depth(w, h, self.canvas.surface_format(), needs_depth);
+                }
+                None => {
+                    self.offscreen_output_target = Some(
+                        self.framebuffer_manager
+                            .new_render_target(w, h, needs_depth),
+                    );
+                }
             }
-            self.offscreen_output_target.as_mut().unwrap().resize(
-                w,
-                h,
-                self.canvas.surface_format(),
-            );
         }
 
         let frame_view = match &frame {
@@ -2152,12 +2199,18 @@ impl Window {
     /// re-register with egui) afterwards.
     pub(crate) fn offscreen_output_view(&mut self) -> wgpu::TextureView {
         let (w, h) = (self.width().max(1), self.height().max(1));
+        // Single-sample rasterization reuses this target's depth; creating it up
+        // front keeps the returned view valid across the next render.
+        let needs_depth = self.canvas.sample_count() == 1;
         if self.offscreen_output_target.is_none() {
-            self.offscreen_output_target =
-                Some(self.framebuffer_manager.new_render_target(w, h, true));
+            self.offscreen_output_target = Some(self.framebuffer_manager.new_render_target(
+                w,
+                h,
+                needs_depth,
+            ));
         }
         let target = self.offscreen_output_target.as_mut().unwrap();
-        target.resize(w, h, self.canvas.surface_format());
+        target.resize_with_depth(w, h, self.canvas.surface_format(), needs_depth);
         target
             .color_view()
             .expect("offscreen render target is never the screen")
