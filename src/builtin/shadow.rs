@@ -306,11 +306,18 @@ pub struct ShadowMapper {
 }
 
 impl ShadowMapper {
-    /// Creates a shadow mapper with the given per-layer resolution.
+    /// Creates a shadow mapper with the given per-layer resolution and the
+    /// default [`MAX_SHADOW_VIEWS`] atlas layers.
     pub fn new(resolution: u32) -> Self {
+        Self::with_layers(resolution, MAX_SHADOW_VIEWS as u32)
+    }
+
+    /// Creates a shadow mapper with the given per-layer resolution and initial
+    /// atlas layer count (clamped to `1..=MAX_SHADOW_VIEWS`).
+    pub fn with_layers(resolution: u32, atlas_layers: u32) -> Self {
         let ctxt = Context::get();
         let resolution = resolution.max(1);
-        let atlas_layers = MAX_SHADOW_VIEWS as u32;
+        let atlas_layers = atlas_layers.clamp(1, MAX_SHADOW_VIEWS as u32);
 
         let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, atlas_layers);
         let (transmittance_atlas, transmittance_layer_views, transmittance_array_view) =

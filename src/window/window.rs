@@ -174,6 +174,8 @@ pub struct Window {
     pub(super) aov_renderer: Option<crate::builtin::AovRenderer>,
     /// Whether the window is hidden. Hidden windows render offscreen.
     pub(super) hidden: bool,
+    /// One-shot flag requesting a surface-to-readback copy on the next visible frame.
+    pub(super) pending_readback: bool,
     pub(super) should_close: bool,
     /// `true` until the first surface texture has been successfully acquired.
     /// While set, frame acquisition retries (pumping window events) instead of
@@ -283,6 +285,18 @@ impl Window {
     #[inline]
     pub fn canvas_mut(&mut self) -> &mut Canvas {
         &mut self.canvas
+    }
+
+    /// Requests that the next rendered visible frame be copied into the readback
+    /// texture so [`snap`](Self::snap), [`snap_rect`](Self::snap_rect),
+    /// [`snap_image`](Self::snap_image), and [`snap_begin`](Self::snap_begin)
+    /// can read it back after presentation.
+    ///
+    /// Hidden and headless windows render into an offscreen texture that is read
+    /// back directly without calling this method.
+    #[inline]
+    pub fn request_readback(&mut self) {
+        self.pending_readback = true;
     }
 
     /// Queues an event supplied by an embedding host.
@@ -1159,12 +1173,19 @@ impl Window {
     ) -> Window {
         let (event_send, event_receive) = mpsc::channel();
         let hide = !window_attrs.visible;
+        let gpu_timing = setup.as_ref().map_or(true, |s| s.gpu_timing);
+        let shadow_resolution = setup
+            .as_ref()
+            .map_or(DEFAULT_SHADOW_RESOLUTION, |s| s.shadow_resolution);
+        let shadow_atlas_layers = setup
+            .as_ref()
+            .map_or(crate::builtin::MAX_SHADOW_VIEWS as u32, |s| {
+                s.shadow_atlas_layers
+            });
         let canvas = Canvas::open(window_attrs, setup, event_send).await;
         let (width, height) = canvas.size();
-        // The HDR resolve pass tonemaps into the LDR swapchain. The rasterizer's
-        // material pipelines are single-sampled, so the HDR film is too (see the
-        // note in `render_single_frame`).
         let canvas_surface_format = canvas.surface_format();
+        let sample_count = canvas.sample_count();
 
         // Track window count for proper cleanup
         Context::increment_window_count();
@@ -1179,7 +1200,7 @@ impl Window {
             close_modifiers: None,
             last_timings: None,
             last_frame_instant: None,
-            gpu_timer: GpuTimer::new(),
+            gpu_timer: GpuTimer::new(gpu_timing),
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
@@ -1196,7 +1217,7 @@ impl Window {
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
-            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             skybox_background_visible: true,
             diffuse_ibl: crate::renderer::DiffuseIbl::CoarsestMip,
@@ -1223,7 +1244,8 @@ impl Window {
             viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             hidden: hide,
-            shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
+            pending_readback: false,
+            shadow_mapper: ShadowMapper::with_layers(shadow_resolution, shadow_atlas_layers),
             framebuffer_manager,
             #[cfg(feature = "recording")]
             recording: None,
@@ -1261,10 +1283,14 @@ impl Window {
         T: Into<wgpu::SurfaceTarget<'static>>,
     {
         let (event_send, event_receive) = mpsc::channel();
+        let gpu_timing = setup.gpu_timing;
+        let shadow_resolution = setup.shadow_resolution;
+        let shadow_atlas_layers = setup.shadow_atlas_layers;
         let canvas =
             Canvas::open_embedded(surface_target, width, height, Some(setup), event_send).await;
         let (width, height) = canvas.size();
         let canvas_surface_format = canvas.surface_format();
+        let sample_count = canvas.sample_count();
 
         Context::increment_window_count();
         WindowCache::populate();
@@ -1277,7 +1303,7 @@ impl Window {
             close_modifiers: None,
             last_timings: None,
             last_frame_instant: None,
-            gpu_timer: GpuTimer::new(),
+            gpu_timer: GpuTimer::new(gpu_timing),
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
@@ -1294,7 +1320,7 @@ impl Window {
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
-            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             skybox_background_visible: true,
             diffuse_ibl: crate::renderer::DiffuseIbl::CoarsestMip,
@@ -1321,7 +1347,8 @@ impl Window {
             viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             hidden: false,
-            shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
+            pending_readback: false,
+            shadow_mapper: ShadowMapper::with_layers(shadow_resolution, shadow_atlas_layers),
             framebuffer_manager,
             #[cfg(feature = "recording")]
             recording: None,
@@ -1338,6 +1365,15 @@ impl Window {
         setup: Option<CanvasSetup>,
     ) -> Window {
         let (event_send, event_receive) = mpsc::channel();
+        let gpu_timing = setup.as_ref().map_or(true, |s| s.gpu_timing);
+        let shadow_resolution = setup
+            .as_ref()
+            .map_or(DEFAULT_SHADOW_RESOLUTION, |s| s.shadow_resolution);
+        let shadow_atlas_layers = setup
+            .as_ref()
+            .map_or(crate::builtin::MAX_SHADOW_VIEWS as u32, |s| {
+                s.shadow_atlas_layers
+            });
         let canvas = Canvas::open_headless(width, height, setup, event_send).await;
         let (width, height) = canvas.size();
         let canvas_surface_format = canvas.surface_format();
@@ -1354,7 +1390,7 @@ impl Window {
             close_modifiers: None,
             last_timings: None,
             last_frame_instant: None,
-            gpu_timer: GpuTimer::new(),
+            gpu_timer: GpuTimer::new(gpu_timing),
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
@@ -1399,7 +1435,8 @@ impl Window {
             aov_renderer: None,
             // A headless window has no surface; always render off-screen.
             hidden: true,
-            shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
+            pending_readback: false,
+            shadow_mapper: ShadowMapper::with_layers(shadow_resolution, shadow_atlas_layers),
             framebuffer_manager,
             #[cfg(feature = "recording")]
             recording: None,

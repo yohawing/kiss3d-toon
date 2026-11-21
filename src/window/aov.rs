@@ -218,16 +218,20 @@ impl Window {
         );
         ctxt.submit(std::iter::once(encoder.finish()));
 
-        // Mirror the regular render path: copy the output into the readback
-        // texture so `snap`/`snap_image` see the visualized AOV on native.
-        let out_color = self
-            .offscreen_output_target
-            .as_ref()
-            .expect("offscreen output target was just created")
-            .color_texture()
-            .expect("offscreen render target is never the screen")
-            .clone();
-        self.canvas.copy_texture_to_readback(&out_color);
+        // Hidden/headless windows read `offscreen_output_target` directly in `snap*`.
+        // Visible windows only copy into `readback_texture` when requested.
+        let pending_readback = self.pending_readback;
+        self.pending_readback = false;
+        if !self.hidden && pending_readback {
+            let out_color = self
+                .offscreen_output_target
+                .as_ref()
+                .expect("offscreen output target was just created")
+                .color_texture()
+                .expect("offscreen render target is never the screen")
+                .clone();
+            self.canvas.copy_texture_to_readback(&out_color);
+        }
     }
 
     /// Linearly normalizes a raw linear-depth buffer into an 8-bit grayscale

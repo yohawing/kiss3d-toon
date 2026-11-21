@@ -1,6 +1,6 @@
 //! Unified wgpu-based canvas for both native and web platforms.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -30,24 +30,26 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu::ExperimentalFeatures;
 
-/// Computes the device features to request.
+/// Computes the default device features to request.
 ///
-/// Opts into wgpu's experimental ray query + acceleration-structure features
-/// whenever the adapter supports them, so the path tracer can use the hardware
-/// backend; on platforms without support the feature is simply not requested and
-/// the portable compute backend is used as a fallback.
-fn raytracing_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+/// Requests `TIMESTAMP_QUERY` when `gpu_timing` is enabled and supported, and
+/// `EXPERIMENTAL_RAY_QUERY` only when the `rt_switcher` feature is compiled in
+/// and supported. Callers can still opt into additional adapter-supported
+/// features via [`CanvasSetup::required_features`].
+fn default_features(adapter: &wgpu::Adapter, gpu_timing: bool) -> wgpu::Features {
     let mut features = wgpu::Features::empty();
     let supported = adapter.features();
 
     // Per-pass GPU timestamp queries power the inspector's render timings. Only
-    // requested when the adapter supports it; otherwise GPU timing is disabled
-    // (and only the CPU submit/present/total timings are reported).
-    if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
+    // requested when enabled in `CanvasSetup::gpu_timing` and supported by the
+    // adapter; otherwise GPU timing is disabled (and only CPU timings are reported).
+    if gpu_timing && supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
         features |= wgpu::Features::TIMESTAMP_QUERY;
     }
 
-    // Hardware ray queries for the path tracer, when the platform supports them.
+    // Hardware ray queries for the path tracer, only when `rt_switcher` is
+    // compiled in and the platform supports them.
+    #[cfg(feature = "rt_switcher")]
     if supported.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
         features |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
     }
@@ -71,11 +73,15 @@ fn experimental_features(required: wgpu::Features) -> ExperimentalFeatures {
     ExperimentalFeatures::disabled()
 }
 
-/// Combines the features kiss3d always wants with the consumer-requested extras from
+/// Combines kiss3d's default features with the consumer-requested extras from
 /// [`CanvasSetup::required_features`], dropping any the adapter doesn't support so
 /// `request_device` never fails on an unavailable feature.
-fn device_features(adapter: &wgpu::Adapter, extra: wgpu::Features) -> wgpu::Features {
-    raytracing_features(adapter) | (extra & adapter.features())
+fn device_features(
+    adapter: &wgpu::Adapter,
+    gpu_timing: bool,
+    extra: wgpu::Features,
+) -> wgpu::Features {
+    default_features(adapter, gpu_timing) | (extra & adapter.features())
 }
 
 // Thread-local EventLoop singleton for the platforms where kiss3d owns and
@@ -311,15 +317,14 @@ pub struct WgpuCanvas {
     button_states: [Action; MouseButton::Button8 as usize + 1],
     out_events: Sender<WindowEvent>,
     modifiers_state: ModifiersState,
-    depth_texture: wgpu::Texture,
-    depth_view: wgpu::TextureView,
-    /// Multisampling texture for MSAA (if enabled)
-    msaa_texture: Option<wgpu::Texture>,
-    msaa_view: Option<wgpu::TextureView>,
+    /// Full-surface depth target, allocated lazily on first [`Self::depth_view`] call.
+    depth_target: OnceCell<(wgpu::Texture, wgpu::TextureView)>,
+    /// Multisampling color target, allocated lazily on first [`Self::msaa_view`] call.
+    msaa_target: OnceCell<(wgpu::Texture, wgpu::TextureView)>,
     /// Number of samples for MSAA
     sample_count: u32,
-    /// Texture for reading back pixels (for screenshots)
-    readback_texture: wgpu::Texture,
+    /// Texture for reading back pixels (for screenshots), allocated lazily on first use.
+    readback_texture: OnceCell<wgpu::Texture>,
     /// Staging buffer reused across `read_pixels` calls, grown on demand, so
     /// per-frame capture doesn't allocate (and free) a GPU buffer every call.
     screenshot_staging: RefCell<Option<wgpu::Buffer>>,
@@ -572,13 +577,17 @@ impl WgpuCanvas {
             // unavailable there, which is an inherent WebGL2 limitation.
             let limits = adapter.limits();
 
-            let required_features = device_features(&adapter, canvas_setup.required_features);
+            let required_features = device_features(
+                &adapter,
+                canvas_setup.gpu_timing,
+                canvas_setup.required_features,
+            );
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("kiss3d device"),
                     required_features,
                     required_limits: limits,
-                    memory_hints: wgpu::MemoryHints::default(),
+                    memory_hints: canvas_setup.memory_hints.clone(),
                     trace: wgpu::Trace::Off,
                     experimental_features: experimental_features(required_features),
                 })
@@ -643,28 +652,7 @@ impl WgpuCanvas {
         };
         surface.configure(&ctxt.device, &surface_config);
 
-        // Create depth texture
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, canvas_setup.samples as u32);
-
-        // Create MSAA texture if needed
         let sample_count = canvas_setup.samples as u32;
-        let (msaa_texture, msaa_view) = if sample_count > 1 {
-            let (tex, view) = Self::create_msaa_texture(
-                &ctxt.device,
-                width,
-                height,
-                surface_format,
-                sample_count,
-            );
-            (Some(tex), Some(view))
-        } else {
-            (None, None)
-        };
-
-        // Create readback texture for screenshots
-        let readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
 
         // Set up WASM event listeners
         #[cfg(target_arch = "wasm32")]
@@ -958,12 +946,10 @@ impl WgpuCanvas {
             button_states: [Action::Release; MouseButton::Button8 as usize + 1],
             out_events,
             modifiers_state: ModifiersState::default(),
-            depth_texture,
-            depth_view,
-            msaa_texture,
-            msaa_view,
+            depth_target: OnceCell::new(),
+            msaa_target: OnceCell::new(),
             sample_count,
-            readback_texture,
+            readback_texture: OnceCell::new(),
             screenshot_staging: RefCell::new(None),
             snap_pending: RefCell::new(None),
             reconfigure_after_present: Cell::new(false),
@@ -1028,13 +1014,17 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to find an adapter for the embedded surface");
-            let required_features = device_features(&adapter, canvas_setup.required_features);
+            let required_features = device_features(
+                &adapter,
+                canvas_setup.gpu_timing,
+                canvas_setup.required_features,
+            );
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("kiss3d embedded device"),
                     required_features,
                     required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::default(),
+                    memory_hints: canvas_setup.memory_hints.clone(),
                     trace: wgpu::Trace::Off,
                     experimental_features: experimental_features(required_features),
                 })
@@ -1079,22 +1069,6 @@ impl WgpuCanvas {
         surface.configure(&ctxt.device, &surface_config);
 
         let sample_count = canvas_setup.samples as u32;
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
-        let (msaa_texture, msaa_view) = if sample_count > 1 {
-            let (texture, view) = Self::create_msaa_texture(
-                &ctxt.device,
-                width,
-                height,
-                surface_format,
-                sample_count,
-            );
-            (Some(texture), Some(view))
-        } else {
-            (None, None)
-        };
-        let readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
 
         WgpuCanvas {
             window: None,
@@ -1106,12 +1080,10 @@ impl WgpuCanvas {
             button_states: [Action::Release; MouseButton::Button8 as usize + 1],
             out_events,
             modifiers_state: ModifiersState::default(),
-            depth_texture,
-            depth_view,
-            msaa_texture,
-            msaa_view,
+            depth_target: OnceCell::new(),
+            msaa_target: OnceCell::new(),
             sample_count,
-            readback_texture,
+            readback_texture: OnceCell::new(),
             screenshot_staging: RefCell::new(None),
             snap_pending: RefCell::new(None),
             reconfigure_after_present: Cell::new(false),
@@ -1150,7 +1122,11 @@ impl WgpuCanvas {
                 .await
                 .expect("Failed to find an appropriate adapter");
 
-            let required_features = device_features(&adapter, canvas_setup.required_features);
+            let required_features = device_features(
+                &adapter,
+                canvas_setup.gpu_timing,
+                canvas_setup.required_features,
+            );
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("kiss3d headless device"),
@@ -1159,7 +1135,7 @@ impl WgpuCanvas {
                     // the path tracer and shadow-mapped material have enough bind
                     // groups and per-stage storage buffers.
                     required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::default(),
+                    memory_hints: canvas_setup.memory_hints.clone(),
                     trace: wgpu::Trace::Off,
                     experimental_features: experimental_features(required_features),
                 })
@@ -1173,7 +1149,6 @@ impl WgpuCanvas {
             surface_format
         };
 
-        let ctxt = Context::get();
         let sample_count = canvas_setup.samples as u32;
 
         // Kept only to carry the size and format; no surface is configured.
@@ -1189,23 +1164,6 @@ impl WgpuCanvas {
             desired_maximum_frame_latency: 2,
         };
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
-        let (msaa_texture, msaa_view) = if sample_count > 1 {
-            let (tex, view) = Self::create_msaa_texture(
-                &ctxt.device,
-                width,
-                height,
-                surface_format,
-                sample_count,
-            );
-            (Some(tex), Some(view))
-        } else {
-            (None, None)
-        };
-        let readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
-
         WgpuCanvas {
             window: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1217,12 +1175,10 @@ impl WgpuCanvas {
             button_states: [Action::Release; MouseButton::Button8 as usize + 1],
             out_events,
             modifiers_state: ModifiersState::default(),
-            depth_texture,
-            depth_view,
-            msaa_texture,
-            msaa_view,
+            depth_target: OnceCell::new(),
+            msaa_target: OnceCell::new(),
             sample_count,
-            readback_texture,
+            readback_texture: OnceCell::new(),
             screenshot_staging: RefCell::new(None),
             snap_pending: RefCell::new(None),
             reconfigure_after_present: Cell::new(false),
@@ -1277,25 +1233,11 @@ impl WgpuCanvas {
             surface.configure(&ctxt.device, &self.surface_config);
         }
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, self.sample_count);
-        self.depth_texture = depth_texture;
-        self.depth_view = depth_view;
-
-        if self.sample_count > 1 {
-            let (msaa_texture, msaa_view) = Self::create_msaa_texture(
-                &ctxt.device,
-                width,
-                height,
-                self.surface_config.format,
-                self.sample_count,
-            );
-            self.msaa_texture = Some(msaa_texture);
-            self.msaa_view = Some(msaa_view);
-        }
-
-        self.readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, self.surface_config.format);
+        // Drop lazily-allocated size-dependent targets; they are recreated on
+        // demand only when their respective paths use them.
+        self.depth_target.take();
+        self.msaa_target.take();
+        self.readback_texture.take();
     }
 
     /// Explicit same-size surface recovery for embedding hosts.
@@ -1305,8 +1247,9 @@ impl WgpuCanvas {
         }
     }
 
-    /// Changes the MSAA sample count, recreating the size-dependent attachments
-    /// (depth + MSAA color) to match.
+    /// Changes the MSAA sample count, invalidating any lazily allocated
+    /// sample-count-dependent attachments (depth + MSAA color) so they are
+    /// recreated to match on next use.
     ///
     /// The swapchain is single-sample regardless, so it is left untouched. The HDR
     /// film, OIT targets and the rasterization pipelines re-derive the new count on
@@ -1318,31 +1261,13 @@ impl WgpuCanvas {
             return;
         }
         self.sample_count = sample_count;
+        self.depth_target.take();
+        self.msaa_target.take();
+    }
 
-        let ctxt = Context::get();
-        let width = self.surface_config.width.max(1);
-        let height = self.surface_config.height.max(1);
-
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
-        self.depth_texture = depth_texture;
-        self.depth_view = depth_view;
-
-        if sample_count > 1 {
-            let (msaa_texture, msaa_view) = Self::create_msaa_texture(
-                &ctxt.device,
-                width,
-                height,
-                self.surface_config.format,
-                sample_count,
-            );
-            self.msaa_texture = Some(msaa_texture);
-            self.msaa_view = Some(msaa_view);
-        } else {
-            // Drop the (now unused) multisampled color attachment.
-            self.msaa_texture = None;
-            self.msaa_view = None;
-        }
+    /// Drops the lazily allocated full-surface depth texture if present.
+    pub(crate) fn release_depth_texture(&mut self) {
+        self.depth_target.take();
     }
 
     fn create_depth_texture(
@@ -1506,6 +1431,9 @@ impl WgpuCanvas {
                                     self.surface_config.width = size.width.max(1);
                                     self.surface_config.height = size.height.max(1);
                                     surface.configure(&ctxt.device, &self.surface_config);
+                                    self.depth_target.take();
+                                    self.msaa_target.take();
+                                    self.readback_texture.take();
                                     self.surface = Some(surface);
                                 }
                             }
@@ -1577,36 +1505,10 @@ impl WgpuCanvas {
                             surface.configure(&ctxt.device, &self.surface_config);
                         }
 
-                        // Recreate depth texture
-                        let (new_depth, new_depth_view) = Self::create_depth_texture(
-                            &ctxt.device,
-                            width,
-                            height,
-                            self.sample_count,
-                        );
-                        self.depth_texture = new_depth;
-                        self.depth_view = new_depth_view;
-
-                        // Recreate MSAA texture if needed
-                        if self.sample_count > 1 {
-                            let (new_msaa, new_msaa_view) = Self::create_msaa_texture(
-                                &ctxt.device,
-                                width,
-                                height,
-                                self.surface_config.format,
-                                self.sample_count,
-                            );
-                            self.msaa_texture = Some(new_msaa);
-                            self.msaa_view = Some(new_msaa_view);
-                        }
-
-                        // Recreate readback texture
-                        self.readback_texture = Self::create_readback_texture(
-                            &ctxt.device,
-                            width,
-                            height,
-                            self.surface_config.format,
-                        );
+                        // Drop lazily-allocated size-dependent targets.
+                        self.depth_target.take();
+                        self.msaa_target.take();
+                        self.readback_texture.take();
                     }
                 }
             }
@@ -1630,36 +1532,10 @@ impl WgpuCanvas {
                     surface.configure(&ctxt.device, &self.surface_config);
                 }
 
-                // Recreate depth texture
-                let (new_depth, new_depth_view) = Self::create_depth_texture(
-                    &ctxt.device,
-                    current_size.width,
-                    current_size.height,
-                    self.sample_count,
-                );
-                self.depth_texture = new_depth;
-                self.depth_view = new_depth_view;
-
-                // Recreate MSAA texture if needed
-                if self.sample_count > 1 {
-                    let (new_msaa, new_msaa_view) = Self::create_msaa_texture(
-                        &ctxt.device,
-                        current_size.width,
-                        current_size.height,
-                        self.surface_config.format,
-                        self.sample_count,
-                    );
-                    self.msaa_texture = Some(new_msaa);
-                    self.msaa_view = Some(new_msaa_view);
-                }
-
-                // Recreate readback texture
-                self.readback_texture = Self::create_readback_texture(
-                    &ctxt.device,
-                    current_size.width,
-                    current_size.height,
-                    self.surface_config.format,
-                );
+                // Drop lazily-allocated size-dependent targets.
+                self.depth_target.take();
+                self.msaa_target.take();
+                self.readback_texture.take();
 
                 let _ = self.out_events.send(WindowEvent::FramebufferSize(
                     current_size.width,
@@ -1798,6 +1674,18 @@ impl WgpuCanvas {
         self.copy_texture_to_readback(&frame.texture);
     }
 
+    fn ensure_readback_texture(&self) -> &wgpu::Texture {
+        self.readback_texture.get_or_init(|| {
+            let ctxt = Context::get();
+            Self::create_readback_texture(
+                &ctxt.device,
+                self.surface_config.width,
+                self.surface_config.height,
+                self.surface_config.format,
+            )
+        })
+    }
+
     /// Copies an arbitrary texture into the readback texture used by
     /// [`read_pixels`](Self::read_pixels).
     ///
@@ -1807,6 +1695,7 @@ impl WgpuCanvas {
     /// to `snap`/`snap_rect`.
     pub fn copy_texture_to_readback(&self, src: &wgpu::Texture) {
         let ctxt = Context::get();
+        let readback_texture = self.ensure_readback_texture();
         let mut encoder = ctxt.create_command_encoder(Some("readback_copy_encoder"));
 
         encoder.copy_texture_to_texture(
@@ -1817,7 +1706,7 @@ impl WgpuCanvas {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &self.readback_texture,
+                texture: readback_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1844,6 +1733,21 @@ impl WgpuCanvas {
         self.finish_read_pixels(out);
     }
 
+    /// Reads pixels directly from `src` (which must have `COPY_SRC` usage and
+    /// match the surface format) into `out` as bottom-to-top RGB data.
+    pub(crate) fn read_pixels_from_texture(
+        &self,
+        src: &wgpu::Texture,
+        out: &mut Vec<u8>,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) {
+        self.begin_read_pixels_from_texture(src, x, y, width, height);
+        self.finish_read_pixels(out);
+    }
+
     /// Starts an asynchronous GPU→CPU readback of the readback texture and
     /// returns immediately: it enqueues the texture→buffer copy and the buffer
     /// map, but never waits on the GPU. Complete it — typically one frame
@@ -1855,6 +1759,19 @@ impl WgpuCanvas {
     /// A second `begin` before the previous readback was finished completes
     /// and discards the previous one first (one readback in flight at a time).
     pub fn begin_read_pixels(&self, x: usize, y: usize, width: usize, height: usize) {
+        let readback_texture = self.ensure_readback_texture();
+        self.begin_read_pixels_from_texture(readback_texture, x, y, width, height);
+    }
+
+    /// Starts an asynchronous GPU→CPU readback directly from `src`.
+    pub(crate) fn begin_read_pixels_from_texture(
+        &self,
+        src: &wgpu::Texture,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) {
         if self.snap_pending.borrow().is_some() {
             self.finish_read_pixels(&mut Vec::new());
         }
@@ -1883,12 +1800,12 @@ impl WgpuCanvas {
             }),
         };
 
-        // Copy from readback texture to staging buffer
+        // Copy from source texture to staging buffer
         let mut encoder = ctxt.create_command_encoder(Some("screenshot_copy_encoder"));
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.readback_texture,
+                texture: src,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: x as u32,
@@ -2003,14 +1920,36 @@ impl WgpuCanvas {
         Some((width as u32, height as u32))
     }
 
-    /// Gets the depth texture view for rendering.
+    /// Gets the depth texture view for rendering, allocating it lazily on first use.
     pub fn depth_view(&self) -> &wgpu::TextureView {
-        &self.depth_view
+        let (_, view) = self.depth_target.get_or_init(|| {
+            let ctxt = Context::get();
+            Self::create_depth_texture(
+                &ctxt.device,
+                self.surface_config.width,
+                self.surface_config.height,
+                self.sample_count,
+            )
+        });
+        view
     }
 
-    /// Gets the MSAA texture view if MSAA is enabled.
+    /// Gets the MSAA texture view if MSAA is enabled, allocating it lazily on first use.
     pub fn msaa_view(&self) -> Option<&wgpu::TextureView> {
-        self.msaa_view.as_ref()
+        if self.sample_count <= 1 {
+            return None;
+        }
+        let (_, view) = self.msaa_target.get_or_init(|| {
+            let ctxt = Context::get();
+            Self::create_msaa_texture(
+                &ctxt.device,
+                self.surface_config.width,
+                self.surface_config.height,
+                self.surface_config.format,
+                self.sample_count,
+            )
+        });
+        Some(view)
     }
 
     /// Gets the sample count for MSAA.
