@@ -15,6 +15,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Low-byte mask for the light kind in [`GpuLight::light_type`]
+/// (`0`=point, `1`=directional, `2`=spot).
+const LIGHT_TYPE_MASK: u32 = 0xff;
+/// Bit flag in [`GpuLight::light_type`] enabling physical inverse-square
+/// distance falloff (glTF `KHR_lights_punctual`) for point and spot lights.
+const LIGHT_FLAG_INVERSE_SQUARE: u32 = 1 << 8;
+
 /// GPU representation of a single light.
 ///
 /// This 64-byte layout is shared by the fixed primary-light uniform array
@@ -24,7 +31,8 @@ use std::rc::Rc;
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub(crate) struct GpuLight {
     position: [f32; 3],
-    light_type: u32, // 0=point, 1=directional, 2=spot
+    /// Low byte: 0=point, 1=directional, 2=spot; bit 8: `LIGHT_FLAG_INVERSE_SQUARE`.
+    light_type: u32,
     direction: [f32; 3],
     intensity: f32,
     color: [f32; 3],
@@ -59,8 +67,9 @@ impl Default for GpuLight {
 
 impl GpuLight {
     /// Packs a scene-collected light into its GPU representation. The light
-    /// type is encoded as 0=point, 1=directional, 2=spot and the spot cone
-    /// angles are pre-converted to cosines for the shader.
+    /// type is encoded in the low byte as 0=point, 1=directional, 2=spot,
+    /// bit 8 carries the opt-in inverse-square flag (point/spot only), and
+    /// the spot cone angles are pre-converted to cosines for the shader.
     pub(crate) fn from_collected(light: &crate::light::CollectedLight) -> GpuLight {
         let (light_type, inner_cone_cos, outer_cone_cos, attenuation_radius) =
             match &light.light_type {
@@ -77,10 +86,16 @@ impl GpuLight {
                     *attenuation_radius,
                 ),
             };
+        let flags =
+            if light.inverse_square && !matches!(light.light_type, LightType::Directional(_)) {
+                LIGHT_FLAG_INVERSE_SQUARE
+            } else {
+                0
+            };
 
         GpuLight {
             position: light.world_position.into(),
-            light_type,
+            light_type: (light_type & LIGHT_TYPE_MASK) | flags,
             direction: light.world_direction.into(),
             intensity: light.intensity,
             color: light.color.into(),
@@ -3614,3 +3629,72 @@ impl Material3d for ObjectMaterial {
 pub static OBJECT_VERTEX_SRC: &str = include_str!("default.wgsl");
 /// Fragment shader of the default object material.
 pub static OBJECT_FRAGMENT_SRC: &str = include_str!("default.wgsl");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::light::{CollectedLight, Light};
+
+    fn collected(light_type: LightType, inverse_square: bool) -> CollectedLight {
+        CollectedLight {
+            light_type,
+            color: Vec3::ONE,
+            intensity: 4.0,
+            world_position: Vec3::new(1.0, 2.0, 3.0),
+            world_direction: Vec3::NEG_Z,
+            radius: 0.0,
+            casts_shadows: true,
+            layers: u32::MAX,
+            inverse_square,
+        }
+    }
+
+    #[test]
+    fn gpu_light_packs_inverse_square_flag_without_growing_struct() {
+        assert_eq!(std::mem::size_of::<GpuLight>(), 64);
+        assert!(!Light::default().inverse_square);
+        assert!(Light::point(10.0).with_inverse_square(true).inverse_square);
+
+        let point_off = GpuLight::from_collected(&collected(
+            LightType::Point {
+                attenuation_radius: 10.0,
+            },
+            false,
+        ));
+        assert_eq!(point_off.light_type, 0);
+
+        let point_on = GpuLight::from_collected(&collected(
+            LightType::Point {
+                attenuation_radius: 10.0,
+            },
+            true,
+        ));
+        assert_eq!(point_on.light_type & LIGHT_TYPE_MASK, 0);
+        assert_ne!(point_on.light_type & LIGHT_FLAG_INVERSE_SQUARE, 0);
+
+        let spot_off = GpuLight::from_collected(&collected(
+            LightType::Spot {
+                inner_cone_angle: 0.2,
+                outer_cone_angle: 0.4,
+                attenuation_radius: 10.0,
+            },
+            false,
+        ));
+        assert_eq!(spot_off.light_type, 2);
+
+        let spot_on = GpuLight::from_collected(&collected(
+            LightType::Spot {
+                inner_cone_angle: 0.2,
+                outer_cone_angle: 0.4,
+                attenuation_radius: 10.0,
+            },
+            true,
+        ));
+        assert_eq!(spot_on.light_type & LIGHT_TYPE_MASK, 2);
+        assert_ne!(spot_on.light_type & LIGHT_FLAG_INVERSE_SQUARE, 0);
+
+        let dir_on =
+            GpuLight::from_collected(&collected(LightType::Directional(Vec3::NEG_Z), true));
+        assert_eq!(dir_on.light_type, 1);
+    }
+}

@@ -384,14 +384,24 @@ fn sample_analytic_light(light: RtLight, p: vec3<f32>, rng: ptr<function, u32>) 
     let dist2 = dot(d, d);
     ls.dist = sqrt(dist2);
     ls.wi = d / ls.dist;
-    // Match the rasterizer's `calculate_point_attenuation`: a smooth window that
-    // reaches zero at `attenuation_radius`, with NO inverse-square term. kiss3d's
-    // light `intensity` is defined by that artistic model (the rasterizer is the
-    // reference), so using physical 1/d² falloff here would make the same point
-    // light look ~orders of magnitude dimmer under the path tracer.
-    let nd = ls.dist / max(light.attenuation_radius, 1e-3);
-    let win = clamp(1.0 - nd * nd, 0.0, 1.0);
-    let atten = win * win;
+    var atten: f32;
+    if (light.inverse_square != 0u) {
+        // glTF KHR_lights_punctual physical inverse-square falloff with smooth range window:
+        // window(d, r) / max(d^2, 1e-4), where window(d, r) = clamp(1 - (d/r)^4, 0, 1)^2.
+        let ratio = clamp(ls.dist / max(light.attenuation_radius, 1e-6), 0.0, 1.0);
+        let r2 = ratio * ratio;
+        let win = clamp(1.0 - r2 * r2, 0.0, 1.0);
+        atten = (win * win) / max(dist2, 1e-4);
+    } else {
+        // Match the rasterizer's `calculate_point_attenuation`: a smooth window that
+        // reaches zero at `attenuation_radius`, with NO inverse-square term. kiss3d's
+        // light `intensity` is defined by that artistic model (the rasterizer is the
+        // reference), so using physical 1/d² falloff here would make the same point
+        // light look ~orders of magnitude dimmer under the path tracer.
+        let nd = ls.dist / max(light.attenuation_radius, 1e-3);
+        let win = clamp(1.0 - nd * nd, 0.0, 1.0);
+        atten = win * win;
+    }
     ls.radiance = light.color * light.intensity * atten;
     if (light.light_type == 2u) {
         let cd = dot(normalize(light.direction), -ls.wi);

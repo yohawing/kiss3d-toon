@@ -178,7 +178,9 @@ pub struct RtLight {
     /// `1` if this light casts shadows (a shadow ray is traced), `0` if it lights
     /// every surface unoccluded.
     pub casts_shadows: u32,
-    pub _pad0: f32,
+    /// `1` when point/spot lights use physical inverse-square distance falloff, `0`
+    /// for the default window-only falloff (ignored by directional lights).
+    pub inverse_square: u32,
     pub _pad1: f32,
     pub _pad2: f32,
 }
@@ -907,6 +909,7 @@ fn hash_light(h: &mut Fnv, cl: &CollectedLight) {
     h.write_f32(cl.radius);
     h.write_u32(cl.layers);
     h.write_u32(cl.casts_shadows as u32);
+    h.write_u32(cl.inverse_square as u32);
 }
 
 fn collected_to_rt(cl: &CollectedLight) -> RtLight {
@@ -945,7 +948,9 @@ fn collected_to_rt(cl: &CollectedLight) -> RtLight {
         radius: cl.radius,
         layers: cl.layers,
         casts_shadows: cl.casts_shadows as u32,
-        _pad0: 0.0,
+        inverse_square: u32::from(
+            cl.inverse_square && !matches!(cl.light_type, LightType::Directional(_)),
+        ),
         _pad1: 0.0,
         _pad2: 0.0,
     }

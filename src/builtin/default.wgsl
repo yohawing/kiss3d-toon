@@ -8,10 +8,13 @@ import package::pbr_env::{equirect_dir_to_uv, env_brdf_approx};
 const PI: f32 = 3.14159265359;
 const MAX_LIGHTS: u32 = 8u;
 
-// Light type constants
+// Light type constants (stored in the low byte of `LightData.light_type`; bit 8
+// carries `LIGHT_FLAG_INVERSE_SQUARE` for point/spot lights).
 const LIGHT_TYPE_POINT: u32 = 0u;
 const LIGHT_TYPE_DIRECTIONAL: u32 = 1u;
 const LIGHT_TYPE_SPOT: u32 = 2u;
+const LIGHT_TYPE_MASK: u32 = 0xffu;
+const LIGHT_FLAG_INVERSE_SQUARE: u32 = 0x100u;
 
 // Single light data structure
 struct LightData {
@@ -800,7 +803,15 @@ fn v_kelemen(LoH: f32) -> f32 {
 }
 
 // Attenuation functions
-fn calculate_point_attenuation(dist: f32, radius: f32) -> f32 {
+fn calculate_point_attenuation(dist: f32, radius: f32, inverse_square: bool) -> f32 {
+    if inverse_square {
+        // glTF KHR_lights_punctual physical inverse-square falloff with smooth range window:
+        // window(d, r) / max(d^2, 1e-4), where window(d, r) = clamp(1 - (d/r)^4, 0, 1)^2.
+        let ratio = clamp(dist / max(radius, 1e-6), 0.0, 1.0);
+        let r2 = ratio * ratio;
+        let window = clamp(1.0 - r2 * r2, 0.0, 1.0);
+        return (window * window) / max(dist * dist, 1e-4);
+    }
     // Smooth falloff that reaches zero at the attenuation radius
     let normalized_dist = clamp(dist / radius, 0.0, 1.0);
     let attenuation = 1.0 - normalized_dist * normalized_dist;
@@ -813,7 +824,8 @@ fn calculate_spot_attenuation(
     dist: f32,
     inner_cone_cos: f32,
     outer_cone_cos: f32,
-    radius: f32
+    radius: f32,
+    inverse_square: bool
 ) -> f32 {
     // Angular attenuation
     let cos_angle = dot(-L, spot_direction);
@@ -824,7 +836,7 @@ fn calculate_spot_attenuation(
     );
 
     // Distance attenuation
-    let dist_attenuation = calculate_point_attenuation(dist, radius);
+    let dist_attenuation = calculate_point_attenuation(dist, radius, inverse_square);
 
     return angular_attenuation * angular_attenuation * dist_attenuation;
 }
@@ -1067,13 +1079,16 @@ fn shade_light(
     var attenuation: f32 = 1.0;
     let light_intensity = light.intensity;
 
-    if light.light_type == LIGHT_TYPE_POINT {
+    let light_type = light.light_type & LIGHT_TYPE_MASK;
+    let inverse_square = (light.light_type & LIGHT_FLAG_INVERSE_SQUARE) != 0u;
+
+    if light_type == LIGHT_TYPE_POINT {
         let light_pos_view = (frame.view * vec4<f32>(light.position, 1.0)).xyz;
         let light_vec = light_pos_view - view_pos;
         let dist = length(light_vec);
         L = normalize(light_vec);
-        attenuation = calculate_point_attenuation(dist, light.attenuation_radius);
-    } else if light.light_type == LIGHT_TYPE_DIRECTIONAL {
+        attenuation = calculate_point_attenuation(dist, light.attenuation_radius, inverse_square);
+    } else if light_type == LIGHT_TYPE_DIRECTIONAL {
         let light_dir_view = normalize(view_mat3 * light.direction);
         L = -light_dir_view;
     } else {
@@ -1088,7 +1103,8 @@ fn shade_light(
             dist,
             light.inner_cone_cos,
             light.outer_cone_cos,
-            light.attenuation_radius
+            light.attenuation_radius,
+            inverse_square
         );
     }
 

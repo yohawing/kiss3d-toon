@@ -20,6 +20,7 @@ struct ClusterAABB {
 
 struct GpuLight {
     position: vec3<f32>,
+    // Low byte: 0=point, 1=directional, 2=spot; bit 8: inverse-square flag.
     light_type: u32,
     direction: vec3<f32>,
     intensity: f32,
