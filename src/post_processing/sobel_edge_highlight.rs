@@ -250,6 +250,10 @@ impl SobelEdgeHighlight {
 }
 
 impl PostProcessingEffect for SobelEdgeHighlight {
+    fn needs_depth(&self) -> bool {
+        true
+    }
+
     fn update(&mut self, _: f32, w: f32, h: f32, znear: f32, zfar: f32) {
         self.shiftx = 2.0 / w;
         self.shifty = 2.0 / h;
@@ -262,7 +266,10 @@ impl PostProcessingEffect for SobelEdgeHighlight {
 
         // Get the source textures and sampler from the render target
         let (color_view, depth_view, sampler) = match target {
-            RenderTarget::Offscreen(o) => (&o.color_view, &o.depth_view, &o.sampler),
+            RenderTarget::Offscreen(o) => match o.depth_view.as_ref() {
+                Some(depth_view) => (&o.color_view, depth_view, &o.sampler),
+                None => return,
+            },
             RenderTarget::Screen => return, // Can't post-process the screen directly
         };
 

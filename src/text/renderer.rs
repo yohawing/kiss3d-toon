@@ -41,8 +41,9 @@ struct TextRenderContext {
 pub struct TextRenderer {
     text: String,
     cache: Cache<'static>,
-    glyph_texture: wgpu::Texture,
-    glyph_texture_view: wgpu::TextureView,
+    /// Glyph cache texture (single channel R8) and its view, created on the
+    /// first frame that draws text.
+    glyph_texture: Option<(wgpu::Texture, wgpu::TextureView)>,
     glyph_sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
@@ -52,9 +53,7 @@ pub struct TextRenderer {
     vertex_capacity: usize,
     contexts: Vec<TextRenderContext>,
     vertices: Vec<TextVertex>,
-    #[allow(dead_code)]
     atlas_width: u32,
-    #[allow(dead_code)]
     atlas_height: u32,
 }
 
@@ -77,26 +76,6 @@ impl TextRenderer {
         let cache = Cache::builder()
             .dimensions(atlas_width, atlas_height)
             .build();
-
-        //
-        // Create glyph texture (single channel R8).
-        //
-        let glyph_texture = ctxt.create_texture(&wgpu::TextureDescriptor {
-            label: Some("text_renderer_glyph_texture"),
-            size: wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let glyph_texture_view = glyph_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let glyph_sampler = ctxt.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("text_renderer_glyph_sampler"),
@@ -248,8 +227,7 @@ impl TextRenderer {
         TextRenderer {
             text: String::new(),
             cache,
-            glyph_texture,
-            glyph_texture_view,
+            glyph_texture: None,
             glyph_sampler,
             pipeline,
             uniform_bind_group_layout,
@@ -282,6 +260,26 @@ impl TextRenderer {
             pos,
             font: font.clone(),
         })
+    }
+
+    /// Creates the glyph cache texture (single channel R8) and its view.
+    fn create_glyph_texture(width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = Context::get().create_texture(&wgpu::TextureDescriptor {
+            label: Some("text_renderer_glyph_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
     }
 
     /// Actually draws the text.
@@ -334,7 +332,11 @@ impl TextRenderer {
         }
 
         // Update glyph cache texture with all queued glyphs
-        let glyph_texture = &self.glyph_texture;
+        let (atlas_width, atlas_height) = (self.atlas_width, self.atlas_height);
+        let (glyph_texture, _) = self
+            .glyph_texture
+            .get_or_insert_with(|| Self::create_glyph_texture(atlas_width, atlas_height));
+        let glyph_texture = &*glyph_texture;
         let _ = self.cache.cache_queued(|rect, data| {
             ctxt.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -452,7 +454,13 @@ impl TextRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.glyph_texture_view),
+                    resource: wgpu::BindingResource::TextureView(
+                        &self
+                            .glyph_texture
+                            .as_ref()
+                            .expect("glyph texture was just created")
+                            .1,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,

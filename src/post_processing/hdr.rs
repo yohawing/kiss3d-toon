@@ -228,20 +228,20 @@ struct HdrTargets {
     scene_view: wgpu::TextureView,
     scene_msaa_texture: Option<wgpu::Texture>,
     scene_msaa_view: Option<wgpu::TextureView>,
-    bloom_mips: Vec<BloomMip>,
-    // Weighted-blended OIT targets: premultiplied weighted color accumulator and
-    // revealage. The transparent geometry pass renders into these; `composite_oit`
-    // samples them (always the single-sample copies) and blends the result over the
-    // opaque HDR scene. When MSAA is active, the geometry pass renders into the
-    // multisampled `*_msaa` attachments and resolves into the single-sample ones.
-    oit_accum_texture: wgpu::Texture,
-    oit_accum_view: wgpu::TextureView,
-    oit_reveal_texture: wgpu::Texture,
-    oit_reveal_view: wgpu::TextureView,
-    oit_accum_msaa_texture: Option<wgpu::Texture>,
-    oit_accum_msaa_view: Option<wgpu::TextureView>,
-    oit_reveal_msaa_texture: Option<wgpu::Texture>,
-    oit_reveal_msaa_view: Option<wgpu::TextureView>,
+}
+
+/// Weighted-blended OIT targets: premultiplied weighted color accumulator and
+/// revealage. Allocated lazily on the first frame that draws transparent
+/// surfaces and invalidated on resize / sample-count change.
+struct OitTargets {
+    _accum_texture: wgpu::Texture,
+    accum_view: wgpu::TextureView,
+    _reveal_texture: wgpu::Texture,
+    reveal_view: wgpu::TextureView,
+    _accum_msaa_texture: Option<wgpu::Texture>,
+    accum_msaa_view: Option<wgpu::TextureView>,
+    _reveal_msaa_texture: Option<wgpu::Texture>,
+    reveal_msaa_view: Option<wgpu::TextureView>,
 }
 
 /// Owns the HDR scene target, bloom chain and resolve pipelines for the
@@ -264,21 +264,17 @@ pub struct HdrPipeline {
     _scene_msaa_texture: Option<wgpu::Texture>,
     scene_msaa_view: Option<wgpu::TextureView>,
 
-    // Bloom mip chain (single-sample HDR), smallest first index is mip 0 = half res.
+    // Bloom mip chain (single-sample HDR), allocated lazily on the first frame
+    // with bloom enabled. First index is mip 0 = half res.
     bloom_mips: Vec<BloomMip>,
+    // 1x1 black Rgba16Float fallback bound when bloom is disabled.
+    _bloom_dummy_texture: wgpu::Texture,
+    bloom_dummy_view: wgpu::TextureView,
 
-    // Weighted-blended OIT targets + composite pipeline. The `*_view`s are the
-    // single-sample targets the composite samples; the `*_msaa_view`s (present only
-    // under MSAA) are the multisampled render targets the geometry pass draws into
-    // and resolves from.
-    _oit_accum_texture: wgpu::Texture,
-    oit_accum_view: wgpu::TextureView,
-    _oit_reveal_texture: wgpu::Texture,
-    oit_reveal_view: wgpu::TextureView,
-    _oit_accum_msaa_texture: Option<wgpu::Texture>,
-    oit_accum_msaa_view: Option<wgpu::TextureView>,
-    _oit_reveal_msaa_texture: Option<wgpu::Texture>,
-    oit_reveal_msaa_view: Option<wgpu::TextureView>,
+    // Weighted-blended OIT targets + composite pipeline. Allocated lazily on the
+    // first frame with transparent draws and kept across frames until a resize
+    // or sample-count change invalidates them.
+    oit: std::cell::OnceCell<OitTargets>,
     oit_layout: wgpu::BindGroupLayout,
     // Rebuilt whenever the sample count changes, since its `MultisampleState.count`
     // must match the (MSAA) HDR scene attachment it composites into.
@@ -294,9 +290,11 @@ pub struct HdrPipeline {
     tonemap_layout: wgpu::BindGroupLayout,
     tonemap_pipeline: wgpu::RenderPipeline,
 
-    // Tony McMapface 48³ display-transform LUT (sampled by the tonemap pass).
-    _tony_lut_texture: wgpu::Texture,
-    tony_lut_view: wgpu::TextureView,
+    // Tony McMapface 48³ display-transform LUT (allocated lazily when
+    // `Tonemap::TonyMcMapface` is selected) + 1x1x1 dummy bound otherwise.
+    tony_lut: Option<(wgpu::Texture, wgpu::TextureView)>,
+    _tony_dummy_texture: wgpu::Texture,
+    tony_dummy_view: wgpu::TextureView,
     tony_sampler: wgpu::Sampler,
 
     vertex_buffer: wgpu::Buffer,
@@ -535,10 +533,23 @@ impl HdrPipeline {
             ],
         });
 
-        // Tony McMapface display-transform LUT: a 48³ Rgba16Float 3D texture decoded
-        // (offline) from the CC0 baked LUT. Sampled with the `x/(x+1)` encoding.
-        let tony_lut = Self::create_tony_lut(&ctxt);
-        let tony_lut_view = tony_lut.create_view(&wgpu::TextureViewDescriptor {
+        // 1x1x1 dummy 3D texture bound when `Tonemap::TonyMcMapface` is not selected;
+        // the real 48³ LUT is uploaded lazily on first use.
+        let tony_dummy = ctxt.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hdr_tony_lut_dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let tony_dummy_view = tony_dummy.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D3),
             ..Default::default()
         });
@@ -552,6 +563,24 @@ impl HdrPipeline {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+
+        // 1x1 black 2D texture bound when bloom is disabled; the full mip chain is
+        // allocated lazily on the first frame with bloom enabled.
+        let bloom_dummy = ctxt.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hdr_bloom_dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let bloom_dummy_view = bloom_dummy.create_view(&wgpu::TextureViewDescriptor::default());
 
         // `hdr_tonemap` imports the shared `apply_tonemap` from the `tonemap_ops`
         // WESL module (composed here instead of source concatenation).
@@ -834,6 +863,9 @@ impl HdrPipeline {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
 
+        let width = width.max(1);
+        let height = height.max(1);
+        let sample_count = sample_count.max(1);
         let targets = Self::create_targets(width, height, sample_count);
 
         HdrPipeline {
@@ -845,15 +877,10 @@ impl HdrPipeline {
             scene_view: targets.scene_view,
             _scene_msaa_texture: targets.scene_msaa_texture,
             scene_msaa_view: targets.scene_msaa_view,
-            bloom_mips: targets.bloom_mips,
-            _oit_accum_texture: targets.oit_accum_texture,
-            oit_accum_view: targets.oit_accum_view,
-            _oit_reveal_texture: targets.oit_reveal_texture,
-            oit_reveal_view: targets.oit_reveal_view,
-            _oit_accum_msaa_texture: targets.oit_accum_msaa_texture,
-            oit_accum_msaa_view: targets.oit_accum_msaa_view,
-            _oit_reveal_msaa_texture: targets.oit_reveal_msaa_texture,
-            oit_reveal_msaa_view: targets.oit_reveal_msaa_view,
+            bloom_mips: Vec::new(),
+            _bloom_dummy_texture: bloom_dummy,
+            bloom_dummy_view,
+            oit: std::cell::OnceCell::new(),
             oit_layout,
             oit_composite_pipeline,
             sampler,
@@ -863,8 +890,9 @@ impl HdrPipeline {
             upsample_pipeline,
             tonemap_layout,
             tonemap_pipeline,
-            _tony_lut_texture: tony_lut,
-            tony_lut_view,
+            tony_lut: None,
+            _tony_dummy_texture: tony_dummy,
+            tony_dummy_view,
             tony_sampler,
             vertex_buffer,
             bloom_uniform,
@@ -1008,7 +1036,8 @@ impl HdrPipeline {
         })
     }
 
-    /// (Re)creates the HDR scene target and bloom chain textures.
+    /// (Re)creates the HDR scene target textures. Bloom mips and OIT targets are
+    /// allocated lazily on first use.
     fn create_targets(width: u32, height: u32, sample_count: u32) -> HdrTargets {
         let ctxt = Context::get();
         let width = width.max(1);
@@ -1055,11 +1084,22 @@ impl HdrPipeline {
             (None, None)
         };
 
-        // Bloom mip chain: each level is half the previous resolution.
+        HdrTargets {
+            scene_texture,
+            scene_view,
+            scene_msaa_texture,
+            scene_msaa_view,
+        }
+    }
+
+    /// Creates the bloom mip chain for the current target size (each level is
+    /// half the previous resolution).
+    fn create_bloom_mips(width: u32, height: u32) -> Vec<BloomMip> {
+        let ctxt = Context::get();
         let mut bloom_mips = Vec::with_capacity(BLOOM_MIPS as usize);
-        let mut mw = width;
-        let mut mh = height;
-        for i in 0..BLOOM_MIPS {
+        let mut mw = width.max(1);
+        let mut mh = height.max(1);
+        for _ in 0..BLOOM_MIPS {
             mw = (mw / 2).max(1);
             mh = (mh / 2).max(1);
             let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
@@ -1084,12 +1124,18 @@ impl HdrPipeline {
                 width: mw,
                 height: mh,
             });
-            let _ = i;
         }
+        bloom_mips
+    }
 
-        // Weighted-blended OIT targets. The single-sample copies are always present
-        // (the composite samples them); under MSAA they double as the geometry pass's
-        // resolve destinations.
+    /// Creates the weighted-blended OIT targets for the given size and sample
+    /// count. Called lazily on the first frame that draws transparent surfaces.
+    fn create_oit_targets(width: u32, height: u32, sample_count: u32) -> OitTargets {
+        let ctxt = Context::get();
+        let width = width.max(1);
+        let height = height.max(1);
+        let sample_count = sample_count.max(1);
+
         let make_oit = |label: &str, format: wgpu::TextureFormat, samples: u32| {
             let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -1114,37 +1160,32 @@ impl HdrPipeline {
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             (tex, view)
         };
-        let (oit_accum_texture, oit_accum_view) = make_oit("hdr_oit_accum", OIT_ACCUM_FORMAT, 1);
-        let (oit_reveal_texture, oit_reveal_view) =
-            make_oit("hdr_oit_reveal", OIT_REVEAL_FORMAT, 1);
-        let (
-            oit_accum_msaa_texture,
-            oit_accum_msaa_view,
-            oit_reveal_msaa_texture,
-            oit_reveal_msaa_view,
-        ) = if sample_count > 1 {
-            let (at, av) = make_oit("hdr_oit_accum_msaa", OIT_ACCUM_FORMAT, sample_count);
-            let (rt, rv) = make_oit("hdr_oit_reveal_msaa", OIT_REVEAL_FORMAT, sample_count);
-            (Some(at), Some(av), Some(rt), Some(rv))
-        } else {
-            (None, None, None, None)
-        };
+        let (accum_texture, accum_view) = make_oit("hdr_oit_accum", OIT_ACCUM_FORMAT, 1);
+        let (reveal_texture, reveal_view) = make_oit("hdr_oit_reveal", OIT_REVEAL_FORMAT, 1);
+        let (accum_msaa_texture, accum_msaa_view, reveal_msaa_texture, reveal_msaa_view) =
+            if sample_count > 1 {
+                let (at, av) = make_oit("hdr_oit_accum_msaa", OIT_ACCUM_FORMAT, sample_count);
+                let (rt, rv) = make_oit("hdr_oit_reveal_msaa", OIT_REVEAL_FORMAT, sample_count);
+                (Some(at), Some(av), Some(rt), Some(rv))
+            } else {
+                (None, None, None, None)
+            };
 
-        HdrTargets {
-            scene_texture,
-            scene_view,
-            scene_msaa_texture,
-            scene_msaa_view,
-            bloom_mips,
-            oit_accum_texture,
-            oit_accum_view,
-            oit_reveal_texture,
-            oit_reveal_view,
-            oit_accum_msaa_texture,
-            oit_accum_msaa_view,
-            oit_reveal_msaa_texture,
-            oit_reveal_msaa_view,
+        OitTargets {
+            _accum_texture: accum_texture,
+            accum_view,
+            _reveal_texture: reveal_texture,
+            reveal_view,
+            _accum_msaa_texture: accum_msaa_texture,
+            accum_msaa_view,
+            _reveal_msaa_texture: reveal_msaa_texture,
+            reveal_msaa_view,
         }
+    }
+
+    fn ensure_oit_targets(&self) -> &OitTargets {
+        self.oit
+            .get_or_init(|| Self::create_oit_targets(self.width, self.height, self.sample_count))
     }
 
     /// Resizes the HDR resources if the size or sample count changed.
@@ -1166,15 +1207,12 @@ impl HdrPipeline {
         self.scene_view = targets.scene_view;
         self._scene_msaa_texture = targets.scene_msaa_texture;
         self.scene_msaa_view = targets.scene_msaa_view;
-        self.bloom_mips = targets.bloom_mips;
-        self._oit_accum_texture = targets.oit_accum_texture;
-        self.oit_accum_view = targets.oit_accum_view;
-        self._oit_reveal_texture = targets.oit_reveal_texture;
-        self.oit_reveal_view = targets.oit_reveal_view;
-        self._oit_accum_msaa_texture = targets.oit_accum_msaa_texture;
-        self.oit_accum_msaa_view = targets.oit_accum_msaa_view;
-        self._oit_reveal_msaa_texture = targets.oit_reveal_msaa_texture;
-        self.oit_reveal_msaa_view = targets.oit_reveal_msaa_view;
+        // Drop lazy size/sample-dependent targets so they reallocate only when
+        // actually needed at the new dimensions / sample count.
+        if self.width != width || self.height != height {
+            self.bloom_mips.clear();
+        }
+        self.oit.take();
         self.width = width;
         self.height = height;
         self.sample_count = sample_count;
@@ -1207,34 +1245,30 @@ impl HdrPipeline {
     /// (color attachment 0): the multisampled target under MSAA, the single-sample
     /// one otherwise. Clear to transparent black before rendering.
     pub fn oit_accum_view(&self) -> &wgpu::TextureView {
-        self.oit_accum_msaa_view
-            .as_ref()
-            .unwrap_or(&self.oit_accum_view)
+        let oit = self.ensure_oit_targets();
+        oit.accum_msaa_view.as_ref().unwrap_or(&oit.accum_view)
     }
 
     /// The OIT revealage attachment the transparent geometry pass renders into (color
     /// attachment 1): the multisampled target under MSAA, the single-sample one
     /// otherwise. Clear to white (1.0) before rendering.
     pub fn oit_reveal_view(&self) -> &wgpu::TextureView {
-        self.oit_reveal_msaa_view
-            .as_ref()
-            .unwrap_or(&self.oit_reveal_view)
+        let oit = self.ensure_oit_targets();
+        oit.reveal_msaa_view.as_ref().unwrap_or(&oit.reveal_view)
     }
 
     /// MSAA resolve target for the OIT accumulation attachment (the single-sample
     /// accum texture), or `None` when MSAA is disabled.
     pub fn oit_accum_resolve_view(&self) -> Option<&wgpu::TextureView> {
-        self.oit_accum_msaa_view
-            .as_ref()
-            .map(|_| &self.oit_accum_view)
+        let oit = self.ensure_oit_targets();
+        oit.accum_msaa_view.as_ref().map(|_| &oit.accum_view)
     }
 
     /// MSAA resolve target for the OIT revealage attachment (the single-sample reveal
     /// texture), or `None` when MSAA is disabled.
     pub fn oit_reveal_resolve_view(&self) -> Option<&wgpu::TextureView> {
-        self.oit_reveal_msaa_view
-            .as_ref()
-            .map(|_| &self.oit_reveal_view)
+        let oit = self.ensure_oit_targets();
+        oit.reveal_msaa_view.as_ref().map(|_| &oit.reveal_view)
     }
 
     /// Composites the transparent OIT result over the opaque HDR scene. Run after
@@ -1244,6 +1278,9 @@ impl HdrPipeline {
         encoder: &mut wgpu::CommandEncoder,
         gpu: &mut crate::renderer::timings::GpuTimer,
     ) {
+        let Some(oit) = self.oit.get() else {
+            return;
+        };
         let ctxt = Context::get();
         // Sample the single-sample (resolved, under MSAA) OIT targets.
         let bind_group = ctxt.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1252,11 +1289,11 @@ impl HdrPipeline {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.oit_accum_view),
+                    resource: wgpu::BindingResource::TextureView(&oit.accum_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.oit_reveal_view),
+                    resource: wgpu::BindingResource::TextureView(&oit.reveal_view),
                 },
             ],
         });
@@ -1572,6 +1609,9 @@ impl HdrPipeline {
 
         let bloom_enabled = self.settings.bloom_enabled && self.settings.bloom_intensity > 0.0;
         if bloom_enabled {
+            if self.bloom_mips.is_empty() {
+                self.bloom_mips = Self::create_bloom_mips(self.width, self.height);
+            }
             self.run_bloom(encoder, gpu);
         }
 
@@ -1619,9 +1659,28 @@ impl HdrPipeline {
             }),
         );
 
-        // When bloom is disabled, sample the (black) first mip so the bind group
-        // is always complete; its zero intensity makes the contribution vanish.
-        let bloom_view = &self.bloom_mips[0].view;
+        // When bloom is disabled, sample the 1x1 black dummy so the bind group is
+        // always complete; its zero intensity makes the contribution vanish.
+        let bloom_view = if bloom_enabled {
+            &self.bloom_mips[0].view
+        } else {
+            &self.bloom_dummy_view
+        };
+
+        // Upload the 48³ Tony McMapface LUT only when that operator is selected.
+        let tony_view = if self.settings.tonemap == Tonemap::TonyMcMapface {
+            let (_, view) = self.tony_lut.get_or_insert_with(|| {
+                let tex = Self::create_tony_lut(&ctxt);
+                let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D3),
+                    ..Default::default()
+                });
+                (tex, view)
+            });
+            view
+        } else {
+            &self.tony_dummy_view
+        };
 
         let bind_group = ctxt.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hdr_tonemap_bind_group"),
@@ -1655,7 +1714,7 @@ impl HdrPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&self.tony_lut_view),
+                    resource: wgpu::BindingResource::TextureView(tony_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
