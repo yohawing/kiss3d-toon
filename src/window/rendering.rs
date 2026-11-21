@@ -330,7 +330,11 @@ impl Window {
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
             self.viewport_compositor.clear(&surface_view);
-            self.canvas.copy_frame_to_readback(&frame);
+            let needs_readback = self.needs_surface_readback();
+            self.pending_readback = false;
+            if needs_readback {
+                self.canvas.copy_frame_to_readback(&frame);
+            }
             self.canvas.present(frame);
             return if self.should_close() {
                 RenderFrameStatus::Closed
@@ -358,6 +362,9 @@ impl Window {
         let sample_count = self.canvas.sample_count();
         if sample_count == 1 || render_viewport.is_none() {
             self.viewport_msaa_depth = None;
+        }
+        if render_viewport.is_some() || (offscreen && sample_count == 1) {
+            self.canvas.release_depth_texture();
         }
 
         let ctxt = Context::get();
@@ -418,11 +425,12 @@ impl Window {
         let resolve_view = self.hdr.scene_resolve_view().cloned();
 
         // Partial viewports use their own viewport-sized depth (multisampled when
-        // MSAA is on); full-size and headless rendering use the canvas depth with
-        // its configured MSAA.
+        // MSAA is on); single-sample offscreen/headless rendering reuses
+        // `offscreen_output_target`'s depth; full-size visible and multisampled
+        // headless rendering use the canvas depth with its configured MSAA.
         let depth_view = if render_viewport.is_some() && sample_count > 1 {
             self.viewport_msaa_depth_view(w, h, sample_count)
-        } else if render_viewport.is_some() {
+        } else if render_offscreen && sample_count == 1 {
             self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
@@ -1404,19 +1412,15 @@ impl Window {
             );
         }
 
-        // Copy the rendered image into the readback texture so `snap`,
-        // `snap_rect` and recording can read it back.
-        match &frame {
-            Some(frame) => self.canvas.copy_frame_to_readback(frame),
-            None => {
-                let color = self
-                    .offscreen_output_target
-                    .as_ref()
-                    .expect("offscreen render target was just created")
-                    .color_texture()
-                    .expect("offscreen render target is never the screen")
-                    .clone();
-                self.canvas.copy_texture_to_readback(&color);
+        // Copy the rendered surface frame into the readback texture only when a
+        // readback or recording capture was requested. Hidden/headless windows
+        // already render into `offscreen_output_target` (which has `COPY_SRC`),
+        // so `snap*` reads from it directly without a full-frame copy.
+        let needs_readback = self.needs_surface_readback();
+        self.pending_readback = false;
+        if needs_readback {
+            if let Some(frame) = &frame {
+                self.canvas.copy_frame_to_readback(frame);
             }
         }
 
@@ -1660,17 +1664,11 @@ impl Window {
             );
         }
 
-        match &frame {
-            Some(frame) => self.canvas.copy_frame_to_readback(frame),
-            None => {
-                let color = self
-                    .offscreen_output_target
-                    .as_ref()
-                    .expect("offscreen render target was just created")
-                    .color_texture()
-                    .expect("offscreen render target is never the screen")
-                    .clone();
-                self.canvas.copy_texture_to_readback(&color);
+        let needs_readback = self.needs_surface_readback();
+        self.pending_readback = false;
+        if needs_readback {
+            if let Some(frame) = &frame {
+                self.canvas.copy_frame_to_readback(frame);
             }
         }
 
@@ -2126,6 +2124,16 @@ impl Window {
         // Bump the frame counter so the per-pass loop re-prepares the main camera
         // (reflector objects then pick up the view-proj set on their Reflector above).
         MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
+    }
+
+    /// Whether the current visible frame must be copied into `readback_texture`
+    /// before presentation.
+    fn needs_surface_readback(&self) -> bool {
+        #[cfg(feature = "recording")]
+        let recording = self.will_capture_recording_frame();
+        #[cfg(not(feature = "recording"))]
+        let recording = false;
+        self.pending_readback || recording
     }
 
     /// The texture view holding the final (LDR, post-tonemap) image of a hidden

@@ -5,6 +5,22 @@ use image::{imageops, ImageBuffer, Rgb};
 use super::Window;
 
 impl Window {
+    /// Returns the offscreen output texture directly when this window is hidden
+    /// / headless and the target matches the current canvas dimensions, avoiding
+    /// an extra full-frame `readback_texture` allocation and copy.
+    fn direct_offscreen_texture(&self) -> Option<&wgpu::Texture> {
+        if !self.hidden {
+            return None;
+        }
+        let (width, height) = self.canvas.size();
+        let crate::resource::RenderTarget::Offscreen(target) =
+            self.offscreen_output_target.as_ref()?
+        else {
+            return None;
+        };
+        (target.width == width && target.height == height).then_some(&target.color_texture)
+    }
+
     /// Captures the current framebuffer as raw RGB pixel data.
     ///
     /// Reads all pixels currently displayed on the screen into a buffer.
@@ -42,7 +58,12 @@ impl Window {
     /// * `width` - The width of the rectangle in pixels
     /// * `height` - The height of the rectangle in pixels
     pub fn snap_rect(&self, out: &mut Vec<u8>, x: usize, y: usize, width: usize, height: usize) {
-        self.canvas.read_pixels(out, x, y, width, height);
+        if let Some(tex) = self.direct_offscreen_texture() {
+            self.canvas
+                .read_pixels_from_texture(tex, out, x, y, width, height);
+        } else {
+            self.canvas.read_pixels(out, x, y, width, height);
+        }
     }
 
     /// Captures the current framebuffer as an image.
@@ -83,8 +104,13 @@ impl Window {
     /// completes and discards the previous one.
     pub fn snap_begin(&self) {
         let (width, height) = self.canvas.size();
-        self.canvas
-            .begin_read_pixels(0, 0, width as usize, height as usize);
+        if let Some(tex) = self.direct_offscreen_texture() {
+            self.canvas
+                .begin_read_pixels_from_texture(tex, 0, 0, width as usize, height as usize);
+        } else {
+            self.canvas
+                .begin_read_pixels(0, 0, width as usize, height as usize);
+        }
     }
 
     /// Completes a capture started by [`Self::snap_begin`], returning the

@@ -27,8 +27,9 @@ impl NumSamples {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 /// Canvas options.
 pub struct CanvasSetup {
     /// Is vsync enabled?
@@ -53,7 +54,46 @@ pub struct CanvasSetup {
     /// the ones kiss3d enables by default.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub required_features: wgpu::Features,
+    /// Memory allocation strategy hint passed to `wgpu::DeviceDescriptor::memory_hints`.
+    /// Defaults to `wgpu::MemoryHints::default()` (`Performance`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub memory_hints: wgpu::MemoryHints,
+    /// Initial per-layer resolution of the rasterizer shadow atlas (default: 2048).
+    pub shadow_resolution: u32,
+    /// Initial number of shadow atlas layers (`1..=MAX_SHADOW_VIEWS`, default: 16).
+    pub shadow_atlas_layers: u32,
+    /// Whether to request `wgpu::Features::TIMESTAMP_QUERY` and allocate GPU
+    /// timestamp-query resources for `Window::render_timings` (default: `true`).
+    pub gpu_timing: bool,
 }
+
+impl PartialEq for CanvasSetup {
+    fn eq(&self, other: &Self) -> bool {
+        let hints_eq = match (&self.memory_hints, &other.memory_hints) {
+            (wgpu::MemoryHints::Performance, wgpu::MemoryHints::Performance)
+            | (wgpu::MemoryHints::MemoryUsage, wgpu::MemoryHints::MemoryUsage) => true,
+            (
+                wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: a,
+                },
+                wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: b,
+                },
+            ) => a == b,
+            _ => false,
+        };
+        self.vsync == other.vsync
+            && self.samples == other.samples
+            && self.canvas_id == other.canvas_id
+            && self.required_features == other.required_features
+            && hints_eq
+            && self.shadow_resolution == other.shadow_resolution
+            && self.shadow_atlas_layers == other.shadow_atlas_layers
+            && self.gpu_timing == other.gpu_timing
+    }
+}
+
+impl Eq for CanvasSetup {}
 
 impl Default for CanvasSetup {
     fn default() -> Self {
@@ -62,6 +102,10 @@ impl Default for CanvasSetup {
             samples: NumSamples::Four,
             canvas_id: "canvas".to_string(),
             required_features: wgpu::Features::empty(),
+            memory_hints: wgpu::MemoryHints::default(),
+            shadow_resolution: super::window::DEFAULT_SHADOW_RESOLUTION,
+            shadow_atlas_layers: crate::builtin::MAX_SHADOW_VIEWS as u32,
+            gpu_timing: true,
         }
     }
 }
@@ -152,6 +196,11 @@ impl Canvas {
     /// Gets the depth texture view for rendering.
     pub fn depth_view(&self) -> &wgpu::TextureView {
         self.canvas.depth_view()
+    }
+
+    /// Drops the lazily allocated full-surface depth texture if present.
+    pub(crate) fn release_depth_texture(&mut self) {
+        self.canvas.release_depth_texture();
     }
 
     /// Gets the MSAA texture view if MSAA is enabled.
@@ -287,10 +336,38 @@ impl Canvas {
         self.canvas.read_pixels(out, x, y, width, height)
     }
 
+    /// Reads pixels directly from `src` (which must have `COPY_SRC` usage and
+    /// match the surface format) without staging through `readback_texture`.
+    pub(crate) fn read_pixels_from_texture(
+        &self,
+        src: &wgpu::Texture,
+        out: &mut Vec<u8>,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) {
+        self.canvas
+            .read_pixels_from_texture(src, out, x, y, width, height)
+    }
+
     /// Starts a non-blocking readback of the readback texture; complete it
     /// with [`Self::finish_read_pixels`]. See `WgpuCanvas::begin_read_pixels`.
     pub fn begin_read_pixels(&self, x: usize, y: usize, width: usize, height: usize) {
         self.canvas.begin_read_pixels(x, y, width, height)
+    }
+
+    /// Starts a non-blocking readback directly from `src`.
+    pub(crate) fn begin_read_pixels_from_texture(
+        &self,
+        src: &wgpu::Texture,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) {
+        self.canvas
+            .begin_read_pixels_from_texture(src, x, y, width, height)
     }
 
     /// Completes a readback started by [`Self::begin_read_pixels`], returning

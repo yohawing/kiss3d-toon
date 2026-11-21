@@ -341,6 +341,13 @@ impl Window {
         Ok(())
     }
 
+    /// Whether the next frame rendered will be captured by an active recording.
+    pub(crate) fn will_capture_recording_frame(&self) -> bool {
+        self.recording
+            .as_ref()
+            .is_some_and(|r| !r.paused && r.frame_counter % r.config.frame_skip == 0)
+    }
+
     /// Captures the current frame if recording is active, not paused, and frame skip allows.
     ///
     /// This is called automatically during `render()` when recording is enabled.

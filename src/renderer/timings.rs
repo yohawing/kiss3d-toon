@@ -169,15 +169,16 @@ pub(crate) struct GpuTimer {
 }
 
 impl GpuTimer {
-    /// Creates a timer, enabling GPU timing only when the device supports
-    /// timestamp queries (otherwise every method is a no-op and `gpu_steps`
-    /// stays `None`).
-    pub(crate) fn new() -> GpuTimer {
+    /// Creates a timer, enabling GPU timing only when requested and the device
+    /// supports timestamp queries (otherwise every method is a no-op and
+    /// `gpu_steps` stays `None`).
+    pub(crate) fn new(requested: bool) -> GpuTimer {
         let ctxt = Context::get();
-        let enabled = ctxt
-            .device
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY);
+        let enabled = requested
+            && ctxt
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY);
 
         if !enabled {
             return GpuTimer {
