@@ -103,6 +103,18 @@ pub struct Light {
     /// [`Object3d::set_light_layers`](crate::scene::Object3d::set_light_layers).
     #[cfg_attr(feature = "serde", serde(default = "all_layers"))]
     pub layers: u32,
+    /// Whether point and spot lights use physical inverse-square distance falloff
+    /// (`window(d, r) / max(d * d, 1e-4)`, where
+    /// `window(d, r) = clamp(1 - (d / r)^4, 0, 1)^2`, matching glTF
+    /// `KHR_lights_punctual`).
+    ///
+    /// When `true`, `intensity * color` is treated as radiant intensity so the
+    /// irradiance at distance `d` well inside the attenuation radius is
+    /// `intensity * color / d^2`. When `false` (the default), point and spot
+    /// lights keep kiss3d's smooth window-only falloff `(1 - (d / r)^2)^2`.
+    /// Directional lights ignore this flag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub inverse_square: bool,
 }
 
 /// Default light-layer mask (all channels) — used by serde so scenes serialized
@@ -122,6 +134,7 @@ impl Default for Light {
             enabled: true,
             casts_shadows: true,
             layers: u32::MAX,
+            inverse_square: false,
         }
     }
 }
@@ -218,6 +231,18 @@ impl Light {
         self.layers = layers;
         self
     }
+
+    /// Enables or disables physical inverse-square distance falloff for point and
+    /// spot lights.
+    ///
+    /// When `true`, distance attenuation becomes
+    /// `clamp(1 - (d / r)^4, 0, 1)^2 / max(d * d, 1e-4)` (glTF
+    /// `KHR_lights_punctual`) instead of the default smooth window
+    /// `(1 - (d / r)^2)^2`. Directional lights ignore this flag.
+    pub fn with_inverse_square(mut self, inverse_square: bool) -> Self {
+        self.inverse_square = inverse_square;
+        self
+    }
 }
 
 /// A light that has been collected from the scene tree with its world-space transform.
@@ -239,6 +264,9 @@ pub struct CollectedLight {
     pub casts_shadows: bool,
     /// Light-layer bitmask (lighting channels); see [`Light::layers`].
     pub layers: u32,
+    /// Whether point/spot lights use physical inverse-square distance falloff; see
+    /// [`Light::inverse_square`].
+    pub inverse_square: bool,
 }
 
 /// Distance-fog falloff curve.

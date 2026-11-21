@@ -167,6 +167,7 @@ impl SceneNodeData3d {
                     radius: light.radius,
                     casts_shadows: light.casts_shadows,
                     layers: light.layers,
+                    inverse_square: light.inverse_square,
                 });
             }
         }

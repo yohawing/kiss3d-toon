@@ -75,7 +75,8 @@ struct RtLight {
     // Light-layer bitmask and shadow-casting flag (1 = trace a shadow ray).
     layers: u32,
     casts_shadows: u32,
-    pad0: f32,
+    // 1 = physical inverse-square falloff (point/spot), 0 = default window-only.
+    inverse_square: u32,
     pad1: f32,
     pad2: f32,
 };
