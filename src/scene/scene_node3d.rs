@@ -2569,6 +2569,21 @@ impl SceneNode3d {
         self.clone()
     }
 
+    /// Sets the per-map UV channel selection (`0` = UV0, `1` = UV1) on this node.
+    #[inline]
+    pub fn set_texture_uv_sets(&mut self, uv_sets: crate::scene::TextureUvSets) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_texture_uv_sets(uv_sets));
+        self.clone()
+    }
+
+    /// Sets the per-map UV channel selection (`0` = UV0, `1` = UV1) on this node and
+    /// all of its descendants.
+    #[inline]
+    pub fn set_texture_uv_sets_recursive(&mut self, uv_sets: crate::scene::TextureUvSets) -> Self {
+        self.apply_to_objects_mut_recursive(&mut |o| o.set_texture_uv_sets(uv_sets));
+        self.clone()
+    }
+
     /// Clears the emissive map for this node's object and all its descendants.
     ///
     /// # See also

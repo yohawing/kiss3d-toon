@@ -224,7 +224,8 @@ struct ObjectUniforms {
     // Refractive transmission (glass) volume attenuation color (rgb); a unused.
     attenuation_color: [f32; 4],
     // Refractive transmission volume params: (thickness, attenuation_distance,
-    // unlit, unused). attenuation_distance < 0 means "infinite" (no tint).
+    // unlit, uv_set_mask). attenuation_distance < 0 means "infinite" (no tint).
+    // uv_set_mask packs TextureUvSets bits (0 = all maps sample UV0).
     volume: [f32; 4],
 }
 
@@ -683,10 +684,11 @@ impl ShaderFeatures {
     const TRANSMISSION: u32 = 1 << 14;
     const REFLECTOR: u32 = 1 << 15;
     const SPECULAR_TINT_MAP: u32 = 1 << 16;
+    const UV1: u32 = 1 << 17;
 
     /// `(WESL feature name, bit)` — names MUST match the `@if(...)` flags in
     /// `default.wgsl`.
-    const TABLE: [(&'static str, u32); 17] = [
+    const TABLE: [(&'static str, u32); 18] = [
         ("deform", Self::DEFORM),
         ("clustered", Self::CLUSTERED),
         ("shadows", Self::SHADOWS),
@@ -704,6 +706,7 @@ impl ShaderFeatures {
         ("transmission", Self::TRANSMISSION),
         ("reflector", Self::REFLECTOR),
         ("specular_tint_map", Self::SPECULAR_TINT_MAP),
+        ("uv1", Self::UV1),
     ];
 
     #[inline]
@@ -860,6 +863,32 @@ fn surface_vertex_buffer_layouts() -> [Option<wgpu::VertexBufferLayout<'static>>
             array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &COLORS,
+        }),
+    ]
+}
+
+/// Extended surface vertex buffer layouts for variants with [`ShaderFeatures::UV1`]:
+/// identical to [`surface_vertex_buffer_layouts`] for slots 0..=6 plus slot 7
+/// carrying the secondary UV stream (`@location(9)`).
+fn surface_vertex_buffer_layouts_uv1() -> [Option<wgpu::VertexBufferLayout<'static>>; 8] {
+    const UVS1: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+        offset: 0,
+        shader_location: 9,
+        format: wgpu::VertexFormat::Float32x2,
+    }];
+    let base = surface_vertex_buffer_layouts();
+    [
+        base[0].clone(),
+        base[1].clone(),
+        base[2].clone(),
+        base[3].clone(),
+        base[4].clone(),
+        base[5].clone(),
+        base[6].clone(),
+        Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &UVS1,
         }),
     ]
 }
@@ -1258,25 +1287,30 @@ impl ObjectMaterial {
         });
 
         // Shared opaque-surface pipeline builder, parameterized by the pipeline
-        // layout and the (WESL-specialized) shader module. The `skinned` flag is
-        // vestigial — deform data is read from group-4 storage by index, so the
-        // vertex layout is identical; the deform variant differs only in the module +
-        // layout passed. Stored on the material and invoked lazily per
-        // `(features, sample_count)` by `surface_pipeline`.
+        // layout, the (WESL-specialized) shader module, and whether the variant
+        // binds the optional secondary UV stream (`use_uv1`). Stored on the
+        // material and invoked lazily per `(features, sample_count)` by
+        // `surface_pipeline`.
         let build_opaque = std::rc::Rc::new(
             |layout: &wgpu::PipelineLayout,
              shader: &wgpu::ShaderModule,
-             skinned: bool,
+             use_uv1: bool,
              cull_mode: Option<wgpu::Face>,
              label: &'static str,
              sample_count: u32| {
                 let ctxt = Context::get();
                 // The deformed pipelines share the plain vertex layout: skin
-                // joints/weights and morph deltas come from group-4 storage buffers,
-                // not vertex attributes. `skinned` only selects the shader + layout.
-                let _ = skinned;
-                let plain_layouts = surface_vertex_buffer_layouts();
-                let buffers: &[Option<wgpu::VertexBufferLayout>] = &plain_layouts;
+                // joints/weights and morph deltas come from group-3 storage buffers,
+                // not vertex attributes. Only `use_uv1` appends the opt-in UV1 slot.
+                let plain_layouts;
+                let uv1_layouts;
+                let buffers: &[Option<wgpu::VertexBufferLayout>] = if use_uv1 {
+                    uv1_layouts = surface_vertex_buffer_layouts_uv1();
+                    &uv1_layouts
+                } else {
+                    plain_layouts = surface_vertex_buffer_layouts();
+                    &plain_layouts
+                };
                 ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
                     layout: Some(layout),
@@ -1328,17 +1362,20 @@ impl ObjectMaterial {
         let build_oit = std::rc::Rc::new(
             |layout: &wgpu::PipelineLayout,
              shader: &wgpu::ShaderModule,
-             skinned: bool,
+             use_uv1: bool,
              cull_mode: Option<wgpu::Face>,
              label: &'static str,
              sample_count: u32| {
                 let ctxt = Context::get();
-                // The deformed pipelines share the plain vertex layout: skin
-                // joints/weights and morph deltas come from group-4 storage buffers,
-                // not vertex attributes. `skinned` only selects the shader + layout.
-                let _ = skinned;
-                let plain_layouts = surface_vertex_buffer_layouts();
-                let buffers: &[Option<wgpu::VertexBufferLayout>] = &plain_layouts;
+                let plain_layouts;
+                let uv1_layouts;
+                let buffers: &[Option<wgpu::VertexBufferLayout>] = if use_uv1 {
+                    uv1_layouts = surface_vertex_buffer_layouts_uv1();
+                    &uv1_layouts
+                } else {
+                    plain_layouts = surface_vertex_buffer_layouts();
+                    &plain_layouts
+                };
                 ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
                     layout: Some(layout),
@@ -2198,11 +2235,12 @@ impl ObjectMaterial {
         } else {
             &self.pipeline_layout
         };
+        let use_uv1 = features.has(ShaderFeatures::UV1);
         let pipeline = match kind {
             PipelineKind::OpaqueCull => (self.build_opaque)(
                 layout,
                 &module,
-                false,
+                use_uv1,
                 Some(wgpu::Face::Back),
                 "object_material_pipeline_cull",
                 sample_count,
@@ -2210,7 +2248,7 @@ impl ObjectMaterial {
             PipelineKind::OpaqueNoCull => (self.build_opaque)(
                 layout,
                 &module,
-                false,
+                use_uv1,
                 None,
                 "object_material_pipeline_no_cull",
                 sample_count,
@@ -2218,7 +2256,7 @@ impl ObjectMaterial {
             PipelineKind::OitCull => (self.build_oit)(
                 layout,
                 &module,
-                false,
+                use_uv1,
                 Some(wgpu::Face::Back),
                 "object_material_oit_pipeline_cull",
                 sample_count,
@@ -2226,7 +2264,7 @@ impl ObjectMaterial {
             PipelineKind::OitNoCull => (self.build_oit)(
                 layout,
                 &module,
-                false,
+                use_uv1,
                 None,
                 "object_material_oit_pipeline_no_cull",
                 sample_count,
@@ -2279,6 +2317,7 @@ impl ObjectMaterial {
         data: &ObjectData3d,
         use_deform: bool,
         shadows_active: bool,
+        use_uv1: bool,
     ) -> ShaderFeatures {
         let f = ShaderFeatures::default()
             // Structural / capability.
@@ -2307,6 +2346,7 @@ impl ObjectMaterial {
             .with(ShaderFeatures::ANISOTROPY, data.anisotropy() != 0.0)
             .with(ShaderFeatures::TRANSMISSION, data.transmission() > 0.0)
             .with(ShaderFeatures::REFLECTOR, data.reflector().is_some())
+            .with(ShaderFeatures::UV1, use_uv1)
     }
 
     /// Rebuilds the shared frame bind group (group 0) from the current per-view
@@ -2863,7 +2903,7 @@ impl Material3d for ObjectMaterial {
                     data.thickness(),
                     encoded,
                     if data.unlit() { 1.0 } else { 0.0 },
-                    0.0,
+                    data.texture_uv_sets().bits() as f32,
                 ]
             },
         };
@@ -3188,6 +3228,11 @@ impl Material3d for ObjectMaterial {
         mesh.normals().write().unwrap().load_to_gpu();
         mesh.faces().write().unwrap().load_to_gpu();
         mesh.colors().write().unwrap().load_to_gpu();
+        if data.texture_uv_sets().uses_uv1() {
+            if let Some(uvs1) = mesh.uvs1() {
+                uvs1.write().unwrap().load_to_gpu();
+            }
+        }
 
         let coords_buffer = mesh.coords().read().unwrap();
         let uvs_buffer = mesh.uvs().read().unwrap();
@@ -3197,6 +3242,17 @@ impl Material3d for ObjectMaterial {
         let Some(colors_buf) = colors_buffer.buffer() else {
             return;
         };
+        // The opt-in UV1 stream is bound only when a map samples it.
+        let uvs1 = mesh.uvs1().filter(|_| data.texture_uv_sets().uses_uv1());
+        let uv1_guard;
+        let uv1_buf = match uvs1 {
+            Some(uvs1) => {
+                uv1_guard = uvs1.read().unwrap();
+                uv1_guard.buffer()
+            }
+            None => None,
+        };
+        let use_uv1 = uv1_buf.is_some();
 
         let coords_buf = match coords_buffer.buffer() {
             Some(b) => b,
@@ -3328,7 +3384,7 @@ impl Material3d for ObjectMaterial {
                 (crate::resource::RenderPhase::Transmission, false)
                 | (crate::resource::RenderPhase::Opaque, false) => PipelineKind::OpaqueNoCull,
             };
-            let mut features = self.object_features(data, use_deform, shadows_active);
+            let mut features = self.object_features(data, use_deform, shadows_active, use_uv1);
             // The prepass ignores all shading features; collapse to the structural key
             // so it stays a single module per deform-ness.
             if kind == PipelineKind::Prepass {
@@ -3364,6 +3420,9 @@ impl Material3d for ObjectMaterial {
             render_pass.set_vertex_buffer(4, inst_colors_buf.slice(..));
             render_pass.set_vertex_buffer(5, inst_deformations_buf.slice(..));
             render_pass.set_vertex_buffer(6, colors_buf.slice(..));
+            if features.has(ShaderFeatures::UV1) {
+                render_pass.set_vertex_buffer(7, uv1_buf.unwrap().slice(..));
+            }
 
             render_pass.set_index_buffer(faces_buf.slice(..), VERTEX_INDEX_FORMAT);
 
@@ -3689,5 +3748,53 @@ mod tests {
         let dir_on =
             GpuLight::from_collected(&collected(LightType::Directional(Vec3::NEG_Z), true));
         assert_eq!(dir_on.light_type, 1);
+    }
+
+    #[test]
+    fn uv1_keeps_default_layouts_and_uniform_size_identical() {
+        assert_eq!(std::mem::size_of::<ObjectUniforms>(), 432);
+        let plain = surface_vertex_buffer_layouts();
+        assert_eq!(plain.len(), 7);
+        let with_uv1 = surface_vertex_buffer_layouts_uv1();
+        assert_eq!(with_uv1.len(), 8);
+        assert_eq!(
+            with_uv1[7].as_ref().unwrap().attributes[0].shader_location,
+            9
+        );
+        assert_eq!(
+            with_uv1[7].as_ref().unwrap().attributes[0].format,
+            wgpu::VertexFormat::Float32x2
+        );
+
+        let base_wgsl = compile_object_wgsl(ShaderFeatures::default());
+        assert!(!base_wgsl.contains("tex_coord1"));
+        assert!(!base_wgsl.contains("@location(9)"));
+        let parallax_wgsl = compile_object_wgsl(
+            ShaderFeatures::default()
+                .with(ShaderFeatures::PARALLAX, true)
+                .with(ShaderFeatures::NORMAL_MAP, true),
+        );
+        assert!(!parallax_wgsl.contains("tex_coord1"));
+        assert!(!parallax_wgsl.contains("uv_mask"));
+
+        let uv1_features = ShaderFeatures::default()
+            .with(ShaderFeatures::UV1, true)
+            .with(ShaderFeatures::DEFORM, true)
+            .with(ShaderFeatures::NORMAL_MAP, true)
+            .with(ShaderFeatures::MR_MAP, true)
+            .with(ShaderFeatures::AO_MAP, true)
+            .with(ShaderFeatures::EMISSIVE_MAP, true)
+            .with(ShaderFeatures::SPECULAR_TINT_MAP, true)
+            .with(ShaderFeatures::PARALLAX, true);
+        let uv1_wgsl = compile_object_wgsl(uv1_features);
+        assert!(uv1_wgsl.contains("@location(9)"));
+        assert!(uv1_wgsl.contains("tex_coord1"));
+        assert!(uv1_wgsl.contains("UV_MAP_BASE_COLOR"));
+        assert!(uv1_wgsl.contains("UV_MAP_SPECULAR_TINT"));
+
+        assert_eq!(
+            uv1_features.prepass_key(),
+            ShaderFeatures(ShaderFeatures::DEFORM)
+        );
     }
 }

@@ -8,8 +8,8 @@ pub use self::object2d::{
 };
 pub use self::object3d::{
     AlphaMode, Bsdf, InstanceComputeBuffers, InstanceData3d, InstancesBuffer3d, Object3d,
-    ObjectData3d, ParallaxMethod, Skin3d, LINES_COLOR_USE_OBJECT, LINES_WIDTH_USE_OBJECT,
-    POINTS_COLOR_USE_OBJECT, POINTS_SIZE_USE_OBJECT,
+    ObjectData3d, ParallaxMethod, Skin3d, TextureUvSets, LINES_COLOR_USE_OBJECT,
+    LINES_WIDTH_USE_OBJECT, POINTS_COLOR_USE_OBJECT, POINTS_SIZE_USE_OBJECT,
 };
 pub use self::scene_node2d::{SceneNode2d, SceneNodeData2d};
 pub use self::scene_node3d::{GltfModel, SceneNode3d, SceneNodeData3d, SkeletonNode3d};

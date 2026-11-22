@@ -229,6 +229,160 @@ impl ParallaxMethod {
     }
 }
 
+/// Per-map UV channel selection (`0` = primary `uvs`, `1` = secondary `uvs1`)
+/// for [`ObjectMaterial`](crate::builtin::ObjectMaterial).
+///
+/// Each bit selects UV1 (`1`) or UV0 (`0`) for one PBR texture slot. When zero
+/// (the default), every map samples UV0 and `ObjectMaterial` compiles and binds
+/// the standard single-UV vertex layout.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TextureUvSets(u32);
+
+impl TextureUvSets {
+    /// Base color / diffuse map (`t_diffuse`).
+    pub const BASE_COLOR: u32 = 1 << 0;
+    /// Metallic-roughness map (`t_metallic_roughness`).
+    pub const METALLIC_ROUGHNESS: u32 = 1 << 1;
+    /// Normal map (`t_normal`).
+    pub const NORMAL: u32 = 1 << 2;
+    /// Ambient occlusion map (`t_ao`).
+    pub const AO: u32 = 1 << 3;
+    /// Emissive map (`t_emissive`).
+    pub const EMISSIVE: u32 = 1 << 4;
+    /// Dielectric specular-tint map (`t_specular_tint`).
+    pub const SPECULAR_TINT: u32 = 1 << 5;
+    /// Height / parallax map (`t_height`).
+    pub const HEIGHT: u32 = 1 << 6;
+    /// Mask of all valid map bits.
+    pub const ALL_MASK: u32 = (1 << 7) - 1;
+
+    /// All maps sample UV0.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Constructs from a raw bitmask, masking off unknown bits.
+    #[inline]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits & Self::ALL_MASK)
+    }
+
+    /// Returns the packed bitmask (bits 0..=6).
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Returns `true` if any map selects UV1.
+    #[inline]
+    pub const fn uses_uv1(self) -> bool {
+        self.0 != 0
+    }
+
+    /// Returns `true` if the map identified by `bit` selects UV1.
+    #[inline]
+    pub const fn map_uses_uv1(self, bit: u32) -> bool {
+        (self.0 & bit) != 0
+    }
+
+    /// Returns a copy with `bit` set (UV1) or cleared (UV0).
+    #[inline]
+    pub const fn with_map_uv1(self, bit: u32, use_uv1: bool) -> Self {
+        let masked = bit & Self::ALL_MASK;
+        if use_uv1 {
+            Self(self.0 | masked)
+        } else {
+            Self(self.0 & !masked)
+        }
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the base color texture.
+    #[inline]
+    pub const fn with_base_color_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::BASE_COLOR, use_uv1)
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the metallic-roughness map.
+    #[inline]
+    pub const fn with_metallic_roughness_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::METALLIC_ROUGHNESS, use_uv1)
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the normal map.
+    #[inline]
+    pub const fn with_normal_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::NORMAL, use_uv1)
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the ambient occlusion map.
+    #[inline]
+    pub const fn with_ao_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::AO, use_uv1)
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the emissive map.
+    #[inline]
+    pub const fn with_emissive_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::EMISSIVE, use_uv1)
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the specular-tint map.
+    #[inline]
+    pub const fn with_specular_tint_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::SPECULAR_TINT, use_uv1)
+    }
+
+    /// Selects UV1 (`true`) or UV0 (`false`) for the height / parallax map.
+    #[inline]
+    pub const fn with_height_uv1(self, use_uv1: bool) -> Self {
+        self.with_map_uv1(Self::HEIGHT, use_uv1)
+    }
+
+    /// Whether the base color texture samples UV1.
+    #[inline]
+    pub const fn base_color_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::BASE_COLOR)
+    }
+
+    /// Whether the metallic-roughness map samples UV1.
+    #[inline]
+    pub const fn metallic_roughness_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::METALLIC_ROUGHNESS)
+    }
+
+    /// Whether the normal map samples UV1.
+    #[inline]
+    pub const fn normal_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::NORMAL)
+    }
+
+    /// Whether the ambient occlusion map samples UV1.
+    #[inline]
+    pub const fn ao_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::AO)
+    }
+
+    /// Whether the emissive map samples UV1.
+    #[inline]
+    pub const fn emissive_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::EMISSIVE)
+    }
+
+    /// Whether the specular-tint map samples UV1.
+    #[inline]
+    pub const fn specular_tint_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::SPECULAR_TINT)
+    }
+
+    /// Whether the height / parallax map samples UV1.
+    #[inline]
+    pub const fn height_uses_uv1(self) -> bool {
+        self.map_uses_uv1(Self::HEIGHT)
+    }
+}
+
 /// Monotonic counter handing out a unique default segmentation id to each new
 /// object. Starts at 1 so that 0 stays reserved for "background" (empty pixels)
 /// in the segmentation auxiliary render output.
@@ -326,6 +480,8 @@ pub struct ObjectData3d {
     ao_map: Option<Arc<Texture>>,
     emissive_map: Option<Arc<Texture>>,
     specular_tint_map: Option<Arc<Texture>>,
+    /// Per-map UV channel selection (`0` = UV0, `1` = UV1).
+    texture_uv_sets: TextureUvSets,
     /// Height/displacement map for parallax mapping (grayscale; brighter = higher).
     height_map: Option<Arc<Texture>>,
     /// Parallax displacement scale (surface depth in UV units). `0` disables it.
@@ -821,6 +977,12 @@ impl ObjectData3d {
         self.specular_tint_map.as_ref()
     }
 
+    /// Returns this object's per-map UV channel selection (`0` = UV0, `1` = UV1).
+    #[inline]
+    pub fn texture_uv_sets(&self) -> TextureUvSets {
+        self.texture_uv_sets
+    }
+
     /// Returns a reference to this object's height/displacement map (parallax).
     #[inline]
     pub fn height_map(&self) -> Option<&Arc<Texture>> {
@@ -1105,6 +1267,7 @@ impl Object3d {
             ao_map: None,
             emissive_map: None,
             specular_tint_map: None,
+            texture_uv_sets: TextureUvSets::default(),
             height_map: None,
             parallax_scale: 0.1,
             parallax_layers: 16.0,
@@ -1279,8 +1442,13 @@ impl Object3d {
             None
         };
         let uvs_buf: Option<&wgpu::Buffer> = if transmittance_tex.is_some() {
-            mesh.uvs().write().unwrap().load_to_gpu();
-            uvs_guard = mesh.uvs().read().unwrap();
+            let uv_vec = if self.data.texture_uv_sets.base_color_uses_uv1() {
+                mesh.uvs1().unwrap_or_else(|| mesh.uvs())
+            } else {
+                mesh.uvs()
+            };
+            uv_vec.write().unwrap().load_to_gpu();
+            uvs_guard = uv_vec.read().unwrap();
             uvs_guard.buffer()
         } else {
             None
@@ -2055,6 +2223,18 @@ impl Object3d {
         self.data.specular_tint_map = None;
     }
 
+    /// Sets the per-map UV channel selection (`0` = UV0, `1` = UV1).
+    #[inline]
+    pub fn set_texture_uv_sets(&mut self, uv_sets: TextureUvSets) {
+        self.data.texture_uv_sets = uv_sets;
+    }
+
+    /// Returns the per-map UV channel selection (`0` = UV0, `1` = UV1).
+    #[inline]
+    pub fn texture_uv_sets(&self) -> TextureUvSets {
+        self.data.texture_uv_sets
+    }
+
     /// Sets the height/displacement map used for parallax mapping from a file.
     ///
     /// The map is grayscale (brighter = higher). Parallax shifts the texture
@@ -2097,5 +2277,51 @@ impl Object3d {
     #[inline]
     pub fn set_parallax_method(&mut self, method: ParallaxMethod) {
         self.data.parallax_method = method;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_uv_sets_packs_and_unpacks_every_map_slot() {
+        let default = TextureUvSets::default();
+        assert_eq!(default.bits(), 0);
+        assert!(!default.uses_uv1());
+        assert!(!default.base_color_uses_uv1());
+        assert!(!default.metallic_roughness_uses_uv1());
+        assert!(!default.normal_uses_uv1());
+        assert!(!default.ao_uses_uv1());
+        assert!(!default.emissive_uses_uv1());
+        assert!(!default.specular_tint_uses_uv1());
+        assert!(!default.height_uses_uv1());
+
+        let sets = TextureUvSets::new()
+            .with_base_color_uv1(true)
+            .with_ao_uv1(true)
+            .with_emissive_uv1(true);
+        assert!(sets.uses_uv1());
+        assert_eq!(
+            sets.bits(),
+            TextureUvSets::BASE_COLOR | TextureUvSets::AO | TextureUvSets::EMISSIVE
+        );
+        assert!(sets.base_color_uses_uv1());
+        assert!(!sets.metallic_roughness_uses_uv1());
+        assert!(!sets.normal_uses_uv1());
+        assert!(sets.ao_uses_uv1());
+        assert!(sets.emissive_uses_uv1());
+        assert!(!sets.specular_tint_uses_uv1());
+        assert!(!sets.height_uses_uv1());
+
+        let cleared = sets.with_ao_uv1(false);
+        assert!(!cleared.ao_uses_uv1());
+        assert!(cleared.base_color_uses_uv1());
+        assert!(cleared.emissive_uses_uv1());
+
+        // Unknown high bits are masked off so float packing in ObjectUniforms.volume.w stays exact.
+        let masked = TextureUvSets::from_bits(u32::MAX);
+        assert_eq!(masked.bits(), TextureUvSets::ALL_MASK);
+        assert_eq!(((masked.bits() as f32) + 0.5) as u32, masked.bits());
     }
 }

@@ -22,6 +22,9 @@ pub struct GpuMesh3d {
     faces: Arc<RwLock<GPUVec<[VertexIndex; 3]>>>,
     normals: Arc<RwLock<GPUVec<Vec3>>>,
     uvs: Arc<RwLock<GPUVec<Vec2>>>,
+    /// Optional secondary texture-coordinate stream (`TEXCOORD_1` / UV1),
+    /// allocated only for meshes that opt in.
+    uvs1: Option<Arc<RwLock<GPUVec<Vec2>>>>,
     colors: Arc<RwLock<GPUVec<Vec3>>>,
     edges: Option<Arc<RwLock<GPUVec<[VertexIndex; 2]>>>>,
     /// Optional per-vertex skinning attributes (glTF `JOINTS_0`/`WEIGHTS_0`),
@@ -273,11 +276,68 @@ impl GpuMesh3d {
             faces,
             normals,
             uvs,
+            uvs1: None,
             colors,
             edges: None,
             skin_vertices: None,
             morph: None,
         }
+    }
+
+    /// Attaches an optional secondary UV stream (`TEXCOORD_1` / UV1).
+    ///
+    /// Length must match the mesh's vertex count and all coordinates must be finite.
+    pub fn set_uvs1(&mut self, uvs: Vec<Vec2>) -> Result<(), &'static str> {
+        if uvs.len() != self.coords.read().unwrap().len() || uvs.iter().any(|uv| !uv.is_finite()) {
+            return Err("Secondary UVs must be finite and match the vertex count");
+        }
+        self.uvs1 = Some(Arc::new(RwLock::new(GPUVec::new(
+            uvs,
+            BufferType::Array,
+            AllocationType::StaticDraw,
+        ))));
+        Ok(())
+    }
+
+    /// Attaches an existing GPU vector as the secondary UV stream (`TEXCOORD_1` / UV1),
+    /// allowing callers to share the buffer without duplicating UV data.
+    pub fn set_uvs1_gpu_vector(
+        &mut self,
+        uvs: Arc<RwLock<GPUVec<Vec2>>>,
+    ) -> Result<(), &'static str> {
+        {
+            let guard = uvs.read().unwrap();
+            if guard.len() != self.coords.read().unwrap().len()
+                || guard
+                    .data()
+                    .as_ref()
+                    .is_some_and(|slice| slice.iter().any(|uv| !uv.is_finite()))
+            {
+                return Err("Secondary UVs must be finite and match the vertex count");
+            }
+        }
+        self.uvs1 = Some(uvs);
+        Ok(())
+    }
+
+    /// Removes the optional secondary UV stream.
+    pub fn clear_uvs1(&mut self) {
+        self.uvs1 = None;
+    }
+
+    /// Secondary texture coordinates (`TEXCOORD_1` / UV1), if attached.
+    pub fn uvs1(&self) -> Option<&Arc<RwLock<GPUVec<Vec2>>>> {
+        self.uvs1.as_ref()
+    }
+
+    /// Whether this mesh carries a secondary UV stream (`TEXCOORD_1` / UV1).
+    pub fn has_uvs1(&self) -> bool {
+        self.uvs1.is_some()
+    }
+
+    /// Returns the secondary UVs buffer if attached and loaded to GPU.
+    pub fn uvs1_buffer(&self) -> Option<wgpu::Buffer> {
+        self.uvs1.as_ref()?.read().ok()?.buffer().cloned()
     }
 
     /// Sets linear RGB vertex colors multiplied by object and instance color.
@@ -603,5 +663,66 @@ impl GpuMesh3d {
 impl From<RenderMesh> for GpuMesh3d {
     fn from(value: RenderMesh) -> Self {
         Self::from_render_mesh(value, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn triangle_mesh() -> GpuMesh3d {
+        GpuMesh3d::new(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            vec![[0, 1, 2]],
+            Some(vec![Vec3::Z; 3]),
+            Some(vec![Vec2::ZERO, Vec2::X, Vec2::Y]),
+            false,
+        )
+    }
+
+    #[test]
+    fn secondary_uv_stream_is_opt_in_and_validates_length_and_finiteness() {
+        let mut mesh = triangle_mesh();
+        assert!(!mesh.has_uvs1());
+        assert!(mesh.uvs1().is_none());
+
+        assert!(mesh.set_uvs1(vec![Vec2::ZERO; 2]).is_err());
+        assert!(mesh
+            .set_uvs1(vec![Vec2::ZERO, Vec2::new(f32::NAN, 0.0), Vec2::ONE])
+            .is_err());
+        assert!(mesh
+            .set_uvs1(vec![Vec2::ZERO, Vec2::new(0.0, f32::INFINITY), Vec2::ONE])
+            .is_err());
+        assert!(!mesh.has_uvs1());
+
+        let uv1 = vec![
+            Vec2::new(0.25, 0.25),
+            Vec2::new(0.75, 0.25),
+            Vec2::new(0.5, 0.75),
+        ];
+        mesh.set_uvs1(uv1.clone()).unwrap();
+        assert!(mesh.has_uvs1());
+        assert_eq!(
+            mesh.uvs1().unwrap().read().unwrap().data().as_deref(),
+            Some(uv1.as_slice())
+        );
+
+        let shared = Arc::new(RwLock::new(GPUVec::new(
+            vec![Vec2::splat(0.5); 3],
+            BufferType::Array,
+            AllocationType::StaticDraw,
+        )));
+        mesh.set_uvs1_gpu_vector(shared.clone()).unwrap();
+        assert!(Arc::ptr_eq(mesh.uvs1().unwrap(), &shared));
+
+        let bad_shared = Arc::new(RwLock::new(GPUVec::new(
+            vec![Vec2::ZERO; 4],
+            BufferType::Array,
+            AllocationType::StaticDraw,
+        )));
+        assert!(mesh.set_uvs1_gpu_vector(bad_shared).is_err());
+
+        mesh.clear_uvs1();
+        assert!(!mesh.has_uvs1());
     }
 }
