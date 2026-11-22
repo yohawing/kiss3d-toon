@@ -16,6 +16,16 @@ const LIGHT_TYPE_SPOT: u32 = 2u;
 const LIGHT_TYPE_MASK: u32 = 0xffu;
 const LIGHT_FLAG_INVERSE_SQUARE: u32 = 0x100u;
 
+// Per-map UV1 selection bits packed in `ObjectUniforms.volume.w` (mirrors
+// `scene::TextureUvSets`). Bit i = 1 samples `tex_coord1`, 0 samples `tex_coord`.
+const UV_MAP_BASE_COLOR: u32 = 1u;
+const UV_MAP_METALLIC_ROUGHNESS: u32 = 2u;
+const UV_MAP_NORMAL: u32 = 4u;
+const UV_MAP_AO: u32 = 8u;
+const UV_MAP_EMISSIVE: u32 = 16u;
+const UV_MAP_SPECULAR_TINT: u32 = 32u;
+const UV_MAP_HEIGHT: u32 = 64u;
+
 // Single light data structure
 struct LightData {
     position: vec3<f32>,
@@ -314,7 +324,7 @@ struct ObjectUniforms {
     reflector_normal: vec4<f32>,
     // Refractive transmission (glass) volume attenuation color (rgb); a unused.
     attenuation_color: vec4<f32>,
-    // Volume params: (thickness, attenuation_distance, unlit, unused).
+    // Volume params: (thickness, attenuation_distance, unlit, uv_set_mask).
     // attenuation_distance < 0 means infinite (no tint).
     volume: vec4<f32>,
 }
@@ -686,6 +696,7 @@ struct VertexInput {
     @location(1) tex_coord: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(8) color: vec3<f32>,
+    @if(uv1) @location(9) tex_coord1: vec2<f32>,
 }
 
 // === GPU vertex deformation: skinning + morph targets (deform variant only) ===
@@ -720,6 +731,7 @@ struct VertexOutput {
     @location(2) world_pos: vec3<f32>,
     @location(3) vert_color: vec4<f32>,
     @location(4) view_pos: vec3<f32>,
+    @if(uv1) @location(5) tex_coord1: vec2<f32>,
 }
 
 // === PBR BRDF Functions ===
@@ -876,6 +888,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.view_pos = view_pos.xyz / view_pos.w;
 
     out.tex_coord = vertex.tex_coord;
+    @if(uv1) out.tex_coord1 = vertex.tex_coord1;
     out.vert_color = instance.inst_color * vec4<f32>(vertex.color, 1.0);
 
     return out;
@@ -941,6 +954,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput, @builtin(vertex_index) 
     }
 
     out.tex_coord = vertex.tex_coord;
+    @if(uv1) out.tex_coord1 = vertex.tex_coord1;
     out.vert_color = instance.inst_color * vec4<f32>(vertex.color, 1.0);
 
     return out;
@@ -1177,34 +1191,61 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // projects these per light to derive the receiver-plane depth bias.
     let dpos_dx = dpdx(in.world_pos);
     let dpos_dy = dpdy(in.world_pos);
-    // UV derivatives (taken in uniform control flow) for the parallax tangent frame.
+    // UV derivatives (taken in uniform control flow) for tangent frames.
     let duv_dx = dpdx(in.tex_coord);
     let duv_dy = dpdy(in.tex_coord);
+    @if(uv1) let duv1_dx = dpdx(in.tex_coord1);
+    @if(uv1) let duv1_dy = dpdy(in.tex_coord1);
 
     // Parallax-occlusion mapping: offset the texture coordinate along the
     // tangent-space view direction so a height map fakes surface relief. All
-    // subsequent maps are sampled at the displaced `uv`.
+    // subsequent maps on that UV set are sampled at the displaced coordinates.
     var uv = in.tex_coord;
+    @if(uv1) var uv1 = in.tex_coord1;
+    @if(uv1) let uv_mask = u32(object.volume.w + 0.5);
     @if(parallax) {
         let n_geo = normalize(in.world_normal);
-        // Prefixed names: `@if` blocks are spliced into the enclosing scope with
-        // their braces stripped, so a plain `tbn`/`world_v` here would collide
-        // with the ones the `normal_map` and `ibl || probes` blocks declare.
-        let parallax_tbn = cotangent_frame(n_geo, dpos_dx, dpos_dy, duv_dx, duv_dy);
         // World-space view direction (inverse of the view rotation applied to the
         // view-space view vector).
         let view_rot = mat3x3<f32>(frame.view[0].xyz, frame.view[1].xyz, frame.view[2].xyz);
         let parallax_world_v = transpose(view_rot) * normalize(-in.view_pos);
-        let ts_view = vec3<f32>(
-            dot(parallax_tbn[0], parallax_world_v),
-            dot(parallax_tbn[1], parallax_world_v),
-            dot(parallax_tbn[2], parallax_world_v)
-        );
-        uv = parallax_uv(in.tex_coord, ts_view);
+        // Prefixed names: `@if` blocks are spliced into the enclosing scope with
+        // their braces stripped, so a plain `tbn`/`world_v` here would collide
+        // with the ones the `normal_map` and `ibl || probes` blocks declare.
+        @if(!uv1) {
+            let parallax_tbn = cotangent_frame(n_geo, dpos_dx, dpos_dy, duv_dx, duv_dy);
+            let ts_view = vec3<f32>(
+                dot(parallax_tbn[0], parallax_world_v),
+                dot(parallax_tbn[1], parallax_world_v),
+                dot(parallax_tbn[2], parallax_world_v)
+            );
+            uv = parallax_uv(in.tex_coord, ts_view);
+        }
+        @if(uv1) {
+            let parallax_use_uv1 = (uv_mask & UV_MAP_HEIGHT) != 0u;
+            let parallax_tbn = cotangent_frame(
+                n_geo,
+                dpos_dx,
+                dpos_dy,
+                select(duv_dx, duv1_dx, parallax_use_uv1),
+                select(duv_dy, duv1_dy, parallax_use_uv1)
+            );
+            let ts_view = vec3<f32>(
+                dot(parallax_tbn[0], parallax_world_v),
+                dot(parallax_tbn[1], parallax_world_v),
+                dot(parallax_tbn[2], parallax_world_v)
+            );
+            if parallax_use_uv1 {
+                uv1 = parallax_uv(in.tex_coord1, ts_view);
+            } else {
+                uv = parallax_uv(in.tex_coord, ts_view);
+            }
+        }
     }
 
     // Sample albedo texture and combine with vertex/object color
-    let albedo_tex = textureSample(t_diffuse, s_diffuse, uv);
+    @if(!uv1) let albedo_tex = textureSample(t_diffuse, s_diffuse, uv);
+    @if(uv1)  let albedo_tex = textureSample(t_diffuse, s_diffuse, select(uv, uv1, (uv_mask & UV_MAP_BASE_COLOR) != 0u));
     let base_color = in.vert_color * object.color;
     let albedo = (albedo_tex * base_color).rgb;
 
@@ -1221,7 +1262,8 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     var roughness = object.roughness;
 
     @if(mr_map) {
-        let mr = textureSample(t_metallic_roughness, s_metallic_roughness, uv);
+        @if(!uv1) let mr = textureSample(t_metallic_roughness, s_metallic_roughness, uv);
+        @if(uv1)  let mr = textureSample(t_metallic_roughness, s_metallic_roughness, select(uv, uv1, (uv_mask & UV_MAP_METALLIC_ROUGHNESS) != 0u));
         // glTF convention: B = metallic, G = roughness
         metallic *= mr.b;
         roughness *= mr.g;
@@ -1234,17 +1276,33 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     var N = normalize(in.world_normal);
 
     @if(normal_map) {
-        let normal_sample = textureSample(t_normal, s_normal, uv).rgb;
-        var tangent_normal = normal_sample * 2.0 - 1.0;
-        // Normal maps use the OpenGL convention (green = +Y pointing "up" in the
-        // image), but our texture V increases downward (V=0 at the top) and the
-        // cotangent frame's bitangent follows +V — so the green channel must be
-        // negated, otherwise all relief reads inverted (bumps look like dents).
-        tangent_normal.y = -tangent_normal.y;
-        // UV-aligned cotangent frame (same basis parallax uses), so tangent-space
-        // normals are oriented consistently with the texture coordinates.
-        let tbn = cotangent_frame(N, dpos_dx, dpos_dy, duv_dx, duv_dy);
-        N = normalize(tbn * tangent_normal);
+        @if(!uv1) {
+            let normal_sample = textureSample(t_normal, s_normal, uv).rgb;
+            var tangent_normal = normal_sample * 2.0 - 1.0;
+            // Normal maps use the OpenGL convention (green = +Y pointing "up" in the
+            // image), but our texture V increases downward (V=0 at the top) and the
+            // cotangent frame's bitangent follows +V — so the green channel must be
+            // negated, otherwise all relief reads inverted (bumps look like dents).
+            tangent_normal.y = -tangent_normal.y;
+            // UV-aligned cotangent frame (same basis parallax uses), so tangent-space
+            // normals are oriented consistently with the texture coordinates.
+            let tbn = cotangent_frame(N, dpos_dx, dpos_dy, duv_dx, duv_dy);
+            N = normalize(tbn * tangent_normal);
+        }
+        @if(uv1) {
+            let normal_use_uv1 = (uv_mask & UV_MAP_NORMAL) != 0u;
+            let normal_sample = textureSample(t_normal, s_normal, select(uv, uv1, normal_use_uv1)).rgb;
+            var tangent_normal = normal_sample * 2.0 - 1.0;
+            tangent_normal.y = -tangent_normal.y;
+            let tbn = cotangent_frame(
+                N,
+                dpos_dx,
+                dpos_dy,
+                select(duv_dx, duv1_dx, normal_use_uv1),
+                select(duv_dy, duv1_dy, normal_use_uv1)
+            );
+            N = normalize(tbn * tangent_normal);
+        }
     }
 
     // Transform normal to view space for lighting
@@ -1258,7 +1316,8 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // Sample ambient occlusion (texture map × screen-space SSAO).
     var ao = 1.0;
     @if(ao_map) {
-        ao = textureSample(t_ao, s_ao, uv).r;
+        @if(!uv1) ao = textureSample(t_ao, s_ao, uv).r;
+        @if(uv1)  ao = textureSample(t_ao, s_ao, select(uv, uv1, (uv_mask & UV_MAP_AO) != 0u)).r;
     }
     // Screen-space AO (present only in the `ssao` variant — the feature mirrors the
     // per-frame SSAO-enabled flag), sampled by framebuffer texel.
@@ -1270,7 +1329,8 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // Sample emissive
     var emissive = object.emissive.rgb;
     @if(emissive_map) {
-        let emissive_sample = textureSample(t_emissive, s_emissive, uv).rgb;
+        @if(!uv1) let emissive_sample = textureSample(t_emissive, s_emissive, uv).rgb;
+        @if(uv1)  let emissive_sample = textureSample(t_emissive, s_emissive, select(uv, uv1, (uv_mask & UV_MAP_EMISSIVE) != 0u)).rgb;
         emissive = emissive * emissive_sample;
     }
 
@@ -1285,7 +1345,8 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     // metals use the albedo.
     var specular_tint = object.specular_tint.rgb;
     @if(specular_tint_map) {
-        specular_tint *= textureSample(t_specular_tint, s_specular_tint, uv).rgb;
+        @if(!uv1) specular_tint *= textureSample(t_specular_tint, s_specular_tint, uv).rgb;
+        @if(uv1)  specular_tint *= textureSample(t_specular_tint, s_specular_tint, select(uv, uv1, (uv_mask & UV_MAP_SPECULAR_TINT) != 0u)).rgb;
     }
     let dielectric_f0 = 0.16 * object.reflectance * object.reflectance * specular_tint;
     let F0 = mix(dielectric_f0, albedo, metallic);
