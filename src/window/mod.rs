@@ -31,7 +31,7 @@ pub use recording::RecordingConfig;
 pub use viewport::RenderViewport;
 #[cfg(target_os = "android")]
 pub use wgpu_canvas::init_android;
-pub use wgpu_canvas::WgpuCanvas;
+pub use wgpu_canvas::{CanvasOpenError, WgpuCanvas};
 pub(crate) use window::SurfaceAcquire;
 pub use window::{RenderFrameStatus, SurfaceSkipReason, SurfaceUnavailableReason, Window};
 pub(crate) use window_cache::WINDOW_CACHE;

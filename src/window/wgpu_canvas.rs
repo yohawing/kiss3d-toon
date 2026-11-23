@@ -304,6 +304,29 @@ pub(crate) fn classify_surface_acquire(
     }
 }
 
+/// Why an embedded or headless canvas could not acquire a GPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanvasOpenError {
+    /// The surface for the embedder's window could not be created.
+    Surface(String),
+    /// No adapter matched the request (no usable GPU or driver).
+    Adapter(String),
+    /// The adapter refused to create a device.
+    Device(String),
+}
+
+impl std::fmt::Display for CanvasOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CanvasOpenError::Surface(error) => write!(f, "Failed to create a surface: {error}"),
+            CanvasOpenError::Adapter(error) => write!(f, "Failed to find a GPU adapter: {error}"),
+            CanvasOpenError::Device(error) => write!(f, "Failed to create a GPU device: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CanvasOpenError {}
+
 /// A unified canvas based on wgpu that works on both native and web platforms.
 #[allow(dead_code)]
 pub struct WgpuCanvas {
@@ -965,6 +988,10 @@ impl WgpuCanvas {
     /// Unlike [`Self::open`], this does not create or poll a winit event loop.
     /// The embedder remains responsible for the native window lifetime, resize
     /// notifications and input delivery through [`Self::push_event`].
+    ///
+    /// # Panics
+    /// Panics when no surface, adapter or device can be created. Use
+    /// [`Self::try_open_embedded`] to handle that instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_embedded<T>(
         surface_target: T,
@@ -973,6 +1000,26 @@ impl WgpuCanvas {
         canvas_setup: Option<CanvasSetup>,
         out_events: Sender<WindowEvent>,
     ) -> Self
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        Self::try_open_embedded(surface_target, width, height, canvas_setup, out_events)
+            .await
+            .unwrap_or_else(|error| panic!("{}", error))
+    }
+
+    /// Like [`Self::open_embedded`], but returns an error instead of panicking
+    /// when no surface, adapter or device can be created. A newly created
+    /// device records uncaptured errors and device loss (see
+    /// [`Context::device_error`]) instead of panicking.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn try_open_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Result<Self, CanvasOpenError>
     where
         T: Into<wgpu::SurfaceTarget<'static>>,
     {
@@ -985,7 +1032,7 @@ impl WgpuCanvas {
             let surface = ctxt
                 .instance
                 .create_surface(surface_target)
-                .expect("Failed to create embedded surface");
+                .map_err(|error| CanvasOpenError::Surface(error.to_string()))?;
             let surface_caps = surface.get_capabilities(&ctxt.adapter);
             let enabled_features = ctxt.device.features();
             let surface_format = surface_caps
@@ -1004,7 +1051,7 @@ impl WgpuCanvas {
             });
             let surface = instance
                 .create_surface(surface_target)
-                .expect("Failed to create embedded surface");
+                .map_err(|error| CanvasOpenError::Surface(error.to_string()))?;
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::default(),
@@ -1013,7 +1060,7 @@ impl WgpuCanvas {
                     apply_limit_buckets: false,
                 })
                 .await
-                .expect("Failed to find an adapter for the embedded surface");
+                .map_err(|error| CanvasOpenError::Adapter(error.to_string()))?;
             let required_features = device_features(
                 &adapter,
                 canvas_setup.gpu_timing,
@@ -1029,7 +1076,7 @@ impl WgpuCanvas {
                     experimental_features: experimental_features(required_features),
                 })
                 .await
-                .expect("Failed to create the embedded device");
+                .map_err(|error| CanvasOpenError::Device(error.to_string()))?;
             let surface_caps = surface.get_capabilities(&adapter);
             let enabled_features = device.features();
             let surface_format = surface_caps
@@ -1041,6 +1088,7 @@ impl WgpuCanvas {
                 .copied()
                 .unwrap_or(surface_caps.formats[0]);
             Context::init(instance, device, queue, adapter, surface_format);
+            Context::get().capture_device_errors();
             (surface, surface_format)
         };
 
@@ -1070,7 +1118,7 @@ impl WgpuCanvas {
 
         let sample_count = canvas_setup.samples as u32;
 
-        WgpuCanvas {
+        Ok(WgpuCanvas {
             window: None,
             window_id: None,
             surface: Some(surface),
@@ -1087,17 +1135,36 @@ impl WgpuCanvas {
             screenshot_staging: RefCell::new(None),
             snap_pending: RefCell::new(None),
             reconfigure_after_present: Cell::new(false),
-        }
+        })
     }
 
     /// Opens a headless canvas: a wgpu context with no window and no surface,
     /// for off-screen rendering. Works without a display server.
+    ///
+    /// # Panics
+    /// Panics when no adapter or device can be created. Use
+    /// [`Self::try_open_headless`] to handle that instead.
     pub async fn open_headless(
         width: u32,
         height: u32,
         canvas_setup: Option<CanvasSetup>,
         out_events: Sender<WindowEvent>,
     ) -> Self {
+        Self::try_open_headless(width, height, canvas_setup, out_events)
+            .await
+            .unwrap_or_else(|error| panic!("{}", error))
+    }
+
+    /// Like [`Self::open_headless`], but returns an error instead of panicking
+    /// when no adapter or device can be created. A newly created device
+    /// records uncaptured errors and device loss (see
+    /// [`Context::device_error`]) instead of panicking.
+    pub async fn try_open_headless(
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Result<Self, CanvasOpenError> {
         let canvas_setup = canvas_setup.unwrap_or_default();
         let width = width.max(1);
         let height = height.max(1);
@@ -1120,7 +1187,7 @@ impl WgpuCanvas {
                     apply_limit_buckets: false,
                 })
                 .await
-                .expect("Failed to find an appropriate adapter");
+                .map_err(|error| CanvasOpenError::Adapter(error.to_string()))?;
 
             let required_features = device_features(
                 &adapter,
@@ -1140,12 +1207,13 @@ impl WgpuCanvas {
                     experimental_features: experimental_features(required_features),
                 })
                 .await
-                .expect("Failed to create device");
+                .map_err(|error| CanvasOpenError::Device(error.to_string()))?;
 
             // No surface to query for a preferred format; pick a widely
             // supported non-sRGB format (gamma is handled in shaders).
             let surface_format = wgpu::TextureFormat::Rgba8Unorm;
             Context::init(instance, device, queue, adapter, surface_format);
+            Context::get().capture_device_errors();
             surface_format
         };
 
@@ -1164,7 +1232,7 @@ impl WgpuCanvas {
             desired_maximum_frame_latency: 2,
         };
 
-        WgpuCanvas {
+        Ok(WgpuCanvas {
             window: None,
             #[cfg(not(target_arch = "wasm32"))]
             window_id: None,
@@ -1186,7 +1254,7 @@ impl WgpuCanvas {
             pending_events: Rc::new(RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
             _event_closures: Vec::new(),
-        }
+        })
     }
 
     /// Resizes the canvas render targets.

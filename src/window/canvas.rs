@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 
 use crate::event::{Action, Key, MouseButton, WindowEvent};
-use crate::window::{SurfaceAcquire, WgpuCanvas};
+use crate::window::{CanvasOpenError, SurfaceAcquire, WgpuCanvas};
 use image::{GenericImage, Pixel};
 use winit::window::WindowAttributes;
 
@@ -139,6 +139,18 @@ impl Canvas {
         }
     }
 
+    /// Like [`Self::open_headless`], but returns an error when no GPU is available.
+    pub async fn try_open_headless(
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Result<Self, CanvasOpenError> {
+        Ok(Canvas {
+            canvas: WgpuCanvas::try_open_headless(width, height, canvas_setup, out_events).await?,
+        })
+    }
+
     /// Opens a canvas on a surface supplied by an embedding application.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_embedded<T>(
@@ -161,6 +173,30 @@ impl Canvas {
             )
             .await,
         }
+    }
+
+    /// Like [`Self::open_embedded`], but returns an error when no GPU is available.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn try_open_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Result<Self, CanvasOpenError>
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        Ok(Canvas {
+            canvas: WgpuCanvas::try_open_embedded(
+                surface_target,
+                width,
+                height,
+                canvas_setup,
+                out_events,
+            )
+            .await?,
+        })
     }
 
     /// Poll all events that occurred since the last call to this method.
