@@ -34,6 +34,19 @@ pub struct Context {
     // Device-owned: never reuse pipelines across window/context recreation.
     pub(crate) mip_pipelines:
         Arc<std::sync::Mutex<std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>>,
+    /// First uncaptured device error or device loss, recorded by the handlers
+    /// installed with [`Context::capture_device_errors`].
+    pub(crate) device_error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+fn record_device_error(errors: &std::sync::Mutex<Option<String>>, message: String) {
+    log::error!("kiss3d: {message}");
+    let mut slot = errors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(message);
+    }
 }
 
 impl Context {
@@ -63,6 +76,7 @@ impl Context {
                 adapter: Arc::new(adapter),
                 surface_format,
                 mip_pipelines: Default::default(),
+                device_error: Default::default(),
             });
         });
     }
@@ -77,6 +91,40 @@ impl Context {
                 .as_ref()
                 .expect("wgpu context not initialized. Call Context::init() first.")
                 .clone()
+        })
+    }
+
+    /// Records uncaptured device errors and device loss instead of panicking.
+    ///
+    /// wgpu's default uncaptured-error handler panics. Embedding hosts need
+    /// to recover instead, so the first error (or the loss reason) is kept
+    /// and reported by [`Context::device_error`]. Later errors are logged.
+    pub(crate) fn capture_device_errors(&self) {
+        let errors = self.device_error.clone();
+        self.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                record_device_error(&errors, format!("wgpu error: {error}"));
+            }));
+        let errors = self.device_error.clone();
+        self.device
+            .set_device_lost_callback(move |reason, message| {
+                record_device_error(&errors, format!("device lost ({reason:?}): {message}"));
+            });
+    }
+
+    /// The first uncaptured device error or device loss of the current
+    /// context, if error capture is installed and something went wrong.
+    ///
+    /// Once set, the device should be treated as unusable: drop every
+    /// window so the context resets, then create a new one.
+    pub fn device_error() -> Option<String> {
+        CONTEXT_SINGLETON.with(|cell| {
+            cell.borrow().as_ref().and_then(|ctx| {
+                ctx.device_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
         })
     }
 
@@ -360,5 +408,25 @@ impl Context {
     /// surface format.
     pub fn render_format() -> wgpu::TextureFormat {
         crate::post_processing::HDR_FORMAT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_device_error, Context};
+
+    #[test]
+    fn device_error_keeps_the_first_error() {
+        let errors = std::sync::Mutex::new(None);
+        record_device_error(&errors, "first".into());
+        record_device_error(&errors, "second".into());
+        assert_eq!(errors.lock().unwrap().as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn device_error_is_none_without_a_context() {
+        if !Context::is_initialized() {
+            assert_eq!(Context::device_error(), None);
+        }
     }
 }

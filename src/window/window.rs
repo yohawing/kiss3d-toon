@@ -23,7 +23,7 @@ use crate::resource::{
 use crate::scene::SceneNode3d;
 use crate::text::TextRenderer;
 use crate::window::canvas::CanvasSetup;
-use crate::window::{Canvas, NumSamples};
+use crate::window::{Canvas, CanvasOpenError, NumSamples};
 use glamx::UVec2;
 use image::{GenericImage, Pixel};
 use winit::dpi::LogicalSize;
@@ -1259,8 +1259,22 @@ impl Window {
         Self::do_new_headless(width, height, Some(setup)).await
     }
 
+    /// Like [`Self::new_headless_with_setup`], but returns an error instead of
+    /// panicking when no GPU adapter or device is available.
+    pub async fn try_new_headless_with_setup(
+        width: u32,
+        height: u32,
+        setup: CanvasSetup,
+    ) -> Result<Window, CanvasOpenError> {
+        Self::try_do_new_headless(width, height, Some(setup)).await
+    }
+
     /// Creates a full-featured window on a surface supplied by an embedding
     /// application, without creating or polling a winit event loop.
+    ///
+    /// # Panics
+    /// Panics when no surface, adapter or device can be created. Use
+    /// [`Self::try_new_embedded`] to handle that instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn new_embedded<T>(
         surface_target: T,
@@ -1271,12 +1285,30 @@ impl Window {
     where
         T: Into<wgpu::SurfaceTarget<'static>>,
     {
+        Self::try_new_embedded(surface_target, width, height, setup)
+            .await
+            .unwrap_or_else(|error| panic!("{}", error))
+    }
+
+    /// Like [`Self::new_embedded`], but returns an error instead of panicking
+    /// when no surface, adapter or device can be created.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn try_new_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        setup: CanvasSetup,
+    ) -> Result<Window, CanvasOpenError>
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
         let (event_send, event_receive) = mpsc::channel();
         let gpu_timing = setup.gpu_timing;
         let shadow_resolution = setup.shadow_resolution;
         let shadow_atlas_layers = setup.shadow_atlas_layers;
         let canvas =
-            Canvas::open_embedded(surface_target, width, height, Some(setup), event_send).await;
+            Canvas::try_open_embedded(surface_target, width, height, Some(setup), event_send)
+                .await?;
         let (width, height) = canvas.size();
         let canvas_surface_format = canvas.surface_format();
         let sample_count = canvas.sample_count();
@@ -1285,7 +1317,7 @@ impl Window {
         WindowCache::populate();
 
         let framebuffer_manager = FramebufferManager::new();
-        Window {
+        Ok(Window {
             should_close: false,
             first_frame: true,
             close_key: None,
@@ -1341,7 +1373,7 @@ impl Window {
             recording: None,
             #[cfg(feature = "rt_switcher")]
             raytracer: (None, false),
-        }
+        })
     }
 
     /// Creates a headless window: a render target backed by no actual window,
@@ -1351,6 +1383,16 @@ impl Window {
         height: u32,
         setup: Option<CanvasSetup>,
     ) -> Window {
+        Self::try_do_new_headless(width, height, setup)
+            .await
+            .unwrap_or_else(|error| panic!("{}", error))
+    }
+
+    async fn try_do_new_headless(
+        width: u32,
+        height: u32,
+        setup: Option<CanvasSetup>,
+    ) -> Result<Window, CanvasOpenError> {
         let (event_send, event_receive) = mpsc::channel();
         let gpu_timing = setup.as_ref().map_or(true, |s| s.gpu_timing);
         let shadow_resolution = setup
@@ -1361,7 +1403,7 @@ impl Window {
             .map_or(crate::builtin::MAX_SHADOW_VIEWS as u32, |s| {
                 s.shadow_atlas_layers
             });
-        let canvas = Canvas::open_headless(width, height, setup, event_send).await;
+        let canvas = Canvas::try_open_headless(width, height, setup, event_send).await?;
         let (width, height) = canvas.size();
         let canvas_surface_format = canvas.surface_format();
         let sample_count = canvas.sample_count();
@@ -1370,7 +1412,7 @@ impl Window {
         WindowCache::populate();
 
         let framebuffer_manager = FramebufferManager::new();
-        Window {
+        Ok(Window {
             should_close: false,
             first_frame: true,
             close_key: None,
@@ -1427,7 +1469,7 @@ impl Window {
             recording: None,
             #[cfg(feature = "rt_switcher")]
             raytracer: (None, false),
-        }
+        })
     }
 }
 
