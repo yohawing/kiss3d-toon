@@ -13,6 +13,8 @@ thread_local! {
     static CONTEXT_SINGLETON: RefCell<Option<Context>> = const { RefCell::new(None) };
     // Track number of active windows to know when to reset the context
     static WINDOW_COUNT: Cell<usize> = const { Cell::new(0) };
+    // Draw commands recorded on this thread since the current frame started.
+    static DRAW_CALLS: Cell<u32> = const { Cell::new(0) };
 }
 
 /// The wgpu rendering context containing all GPU resources needed for rendering.
@@ -182,6 +184,31 @@ impl Context {
     /// Returns the current number of active windows.
     pub fn window_count() -> usize {
         WINDOW_COUNT.with(|count| count.get())
+    }
+
+    /// Counts one draw command (`draw`, `draw_indexed` or an indirect draw)
+    /// recorded on this thread for the frame being rendered.
+    ///
+    /// Every Kiss3D pass calls this next to its draw; custom materials,
+    /// renderers and post-processing effects should do the same so
+    /// [`Window::last_frame_draw_calls`](crate::window::Window::last_frame_draw_calls)
+    /// covers them.
+    #[inline]
+    pub fn count_draw_call() {
+        Self::count_draw_calls(1);
+    }
+
+    /// Counts `count` draw commands recorded on this thread for the frame
+    /// being rendered. See [`Context::count_draw_call`].
+    #[inline]
+    pub fn count_draw_calls(count: u32) {
+        DRAW_CALLS.with(|calls| calls.set(calls.get().saturating_add(count)));
+    }
+
+    /// Returns the draw commands counted since the last call and restarts
+    /// the count. Windows call it at frame start and frame end.
+    pub(crate) fn take_draw_calls() -> u32 {
+        DRAW_CALLS.with(|calls| calls.replace(0))
     }
 
     /// Creates a new buffer on the GPU using a descriptor.
@@ -428,5 +455,17 @@ mod tests {
         if !Context::is_initialized() {
             assert_eq!(Context::device_error(), None);
         }
+    }
+
+    #[test]
+    fn draw_call_count_accumulates_and_resets_on_take() {
+        Context::take_draw_calls();
+        Context::count_draw_call();
+        Context::count_draw_calls(4);
+        assert_eq!(Context::take_draw_calls(), 5);
+        assert_eq!(Context::take_draw_calls(), 0);
+        Context::count_draw_calls(u32::MAX);
+        Context::count_draw_call();
+        assert_eq!(Context::take_draw_calls(), u32::MAX);
     }
 }

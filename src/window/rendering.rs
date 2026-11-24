@@ -272,6 +272,8 @@ impl Window {
         self.last_frame_instant = Some(frame_start);
         let cpu = CpuTimer::start();
         self.gpu_timer.begin_frame();
+        // Draws recorded outside a frame (uploads, picking) are not part of it.
+        Context::take_draw_calls();
 
         // A visible window renders into its surface; a hidden window has no
         // presentable surface, so it renders into an offscreen texture that
@@ -330,6 +332,7 @@ impl Window {
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
             self.viewport_compositor.clear(&surface_view);
+            self.last_frame_draw_calls = Context::take_draw_calls();
             let needs_readback = self.needs_surface_readback();
             self.pending_readback = false;
             if needs_readback {
@@ -1479,6 +1482,7 @@ impl Window {
 
         // Stored before the wasm frame-pacing wait below, so `total` reflects the
         // render work and not the idle wait for the next animation frame.
+        self.last_frame_draw_calls = Context::take_draw_calls();
         self.last_timings = Some(RenderTimings {
             renderer: "Rasterizer",
             frame_wall,
@@ -1542,6 +1546,8 @@ impl Window {
         self.last_frame_instant = Some(frame_start);
         let cpu = CpuTimer::start();
         self.gpu_timer.begin_frame();
+        // Draws recorded outside a frame (uploads, picking) are not part of it.
+        Context::take_draw_calls();
         let offscreen = self.hidden;
 
         let frame = if offscreen {
@@ -1728,6 +1734,7 @@ impl Window {
             }
         });
 
+        self.last_frame_draw_calls = Context::take_draw_calls();
         self.last_timings = Some(RenderTimings {
             renderer: "Path tracer",
             frame_wall,

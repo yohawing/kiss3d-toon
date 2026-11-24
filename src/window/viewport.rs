@@ -185,6 +185,7 @@ impl ViewportCompositor {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..4, 0..1);
+            Context::count_draw_call();
         }
         ctxt.submit(std::iter::once(encoder.finish()));
     }

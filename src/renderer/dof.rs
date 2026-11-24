@@ -311,6 +311,7 @@ impl Dof {
             pass.set_pipeline(&self.coc_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
 
         // 2. Box-downsample the chain so coarser mips pre-blur color and CoC.
@@ -356,6 +357,7 @@ impl Dof {
             pass.set_pipeline(&self.downsample_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
 
         // 3. Gather pass: composite the blurred result back over the scene. The
@@ -392,6 +394,7 @@ impl Dof {
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
     }
 }

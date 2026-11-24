@@ -446,6 +446,7 @@ impl Material3d for NormalsMaterial {
         render_pass.set_index_buffer(faces_buf.slice(..), VERTEX_INDEX_FORMAT);
 
         render_pass.draw_indexed(0..mesh.num_indices(), 0, 0..1);
+        Context::count_draw_call();
     }
 }
 

@@ -590,5 +590,6 @@ impl Material2d for LitMaterial2d {
         render_pass.set_vertex_buffer(4, inst_deformations_buf.slice(..));
         render_pass.set_index_buffer(faces_buf.slice(..), VERTEX_INDEX_FORMAT);
         render_pass.draw_indexed(0..mesh.num_indices(), 0, 0..num_instances as u32);
+        Context::count_draw_call();
     }
 }

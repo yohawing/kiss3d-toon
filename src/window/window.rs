@@ -185,6 +185,9 @@ pub struct Window {
     /// Per-step timings of the most recently rendered frame, for the active
     /// renderer. `None` until the first frame. See [`Window::render_timings`].
     pub(super) last_timings: Option<RenderTimings>,
+    /// Draw commands of the most recently rendered frame. See
+    /// [`Window::last_frame_draw_calls`].
+    pub(super) last_frame_draw_calls: u32,
     /// Instant the previous frame started, to derive the wall-clock frame-to-frame
     /// period ([`RenderTimings::frame_wall`]). `None` until the first frame.
     pub(super) last_frame_instant: Option<web_time::Instant>,
@@ -318,6 +321,19 @@ impl Window {
     #[inline]
     pub fn render_timings(&self) -> Option<&RenderTimings> {
         self.last_timings.as_ref()
+    }
+
+    /// Draw commands issued by the most recently rendered frame.
+    ///
+    /// Counts every `draw`/`draw_indexed` of Kiss3D's passes (shadows, scene
+    /// objects, transparency, wireframe, helpers, text, post-processing and
+    /// compositing) plus those of custom materials and effects that call
+    /// [`Context::count_draw_call`](crate::context::Context::count_draw_call)
+    /// during the frame. It keeps the last value until another frame renders,
+    /// and is `0` before the first frame.
+    #[inline]
+    pub fn last_frame_draw_calls(&self) -> u32 {
+        self.last_frame_draw_calls
     }
 
     /// Renders one frame of a 3D scene with the GPU path tracer.
@@ -1190,6 +1206,7 @@ impl Window {
             close_key: None,
             close_modifiers: None,
             last_timings: None,
+            last_frame_draw_calls: 0,
             last_frame_instant: None,
             gpu_timer: GpuTimer::new(gpu_timing),
             canvas,
@@ -1323,6 +1340,7 @@ impl Window {
             close_key: None,
             close_modifiers: None,
             last_timings: None,
+            last_frame_draw_calls: 0,
             last_frame_instant: None,
             gpu_timer: GpuTimer::new(gpu_timing),
             canvas,
@@ -1418,6 +1436,7 @@ impl Window {
             close_key: None,
             close_modifiers: None,
             last_timings: None,
+            last_frame_draw_calls: 0,
             last_frame_instant: None,
             gpu_timer: GpuTimer::new(gpu_timing),
             canvas,

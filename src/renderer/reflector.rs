@@ -563,5 +563,6 @@ impl ReflectorOit {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
+        Context::count_draw_call();
     }
 }

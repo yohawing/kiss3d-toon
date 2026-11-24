@@ -271,6 +271,7 @@ impl Renderer3d for PointRenderer3d {
         // Draw 6 vertices per point (2 triangles forming a quad)
         let num_vertices = (self.points.len() * 6) as u32;
         render_pass.draw(0..num_vertices, 0..1);
+        Context::count_draw_call();
 
         // Clear points for next frame
         self.points.clear();

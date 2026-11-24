@@ -306,6 +306,7 @@ impl Transmission {
             );
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
     }
 }
