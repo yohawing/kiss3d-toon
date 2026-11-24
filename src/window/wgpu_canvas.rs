@@ -1918,6 +1918,16 @@ impl WgpuCanvas {
     /// flight. Blocks only until the copy's submission completes — a no-op
     /// when a frame of GPU work has been submitted since the `begin`.
     pub fn finish_read_pixels(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.finish_read_pixels_channels(out, false)
+    }
+
+    /// Like [`Self::finish_read_pixels`], but keeps the alpha channel: `out`
+    /// receives RGBA data (4 bytes per pixel, rows bottom-to-top).
+    pub fn finish_read_pixels_rgba(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.finish_read_pixels_channels(out, true)
+    }
+
+    fn finish_read_pixels_channels(&self, out: &mut Vec<u8>, alpha: bool) -> Option<(u32, u32)> {
         let PendingSnap {
             buffer: staging_buffer,
             rx,
@@ -1945,10 +1955,10 @@ impl WgpuCanvas {
             .get_mapped_range()
             .expect("staging buffer is mapped");
 
-        // Convert from BGRA/RGBA to RGB and handle row padding
-        let rgb_size = width * height * 3;
+        // Convert from BGRA/RGBA to RGB(A) and handle row padding
+        let channels = if alpha { 4 } else { 3 };
         out.clear();
-        out.reserve(rgb_size);
+        out.reserve(width * height * channels);
 
         let is_bgra = matches!(
             self.surface_config.format,
@@ -1971,6 +1981,9 @@ impl WgpuCanvas {
                     out.extend_from_slice(&[px[2], px[1], px[0]]);
                 } else {
                     out.extend_from_slice(&[px[0], px[1], px[2]]);
+                }
+                if alpha {
+                    out.push(px[3]);
                 }
             }
         }

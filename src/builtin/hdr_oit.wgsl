@@ -30,9 +30,10 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     // Weighted-average color of all transparent fragments at this pixel.
     let color = accum.rgb / max(accum.a, 1.0e-5);
     // The alpha output (1 - reveal) is the transparent coverage; it drives the
-    // SrcAlpha/OneMinusSrcAlpha *color* blend. The pipeline's alpha blend keeps
-    // the destination alpha, so this does NOT overwrite the scene's alpha channel
-    // (which the tonemap forwards to the surface — clobbering it to 0 here made
-    // the canvas transparent → white page on browsers that composite canvas alpha).
+    // SrcAlpha/OneMinusSrcAlpha *color* blend. The pipeline's alpha blend
+    // composites it over the destination alpha, so this does NOT overwrite the
+    // scene's alpha channel where nothing transparent is drawn (which the tonemap
+    // forwards to the surface — clobbering it to 0 here made the canvas
+    // transparent → white page on browsers that composite canvas alpha).
     return vec4<f32>(color, 1.0 - reveal);
 }
