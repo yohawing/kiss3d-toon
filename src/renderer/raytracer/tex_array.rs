@@ -175,6 +175,7 @@ impl TexArray {
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..4, 0..1);
+            Context::count_draw_call();
         }
         // Clear the fallback layer to white.
         {

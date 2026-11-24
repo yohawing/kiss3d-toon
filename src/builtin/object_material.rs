@@ -3427,6 +3427,7 @@ impl Material3d for ObjectMaterial {
             render_pass.set_index_buffer(faces_buf.slice(..), VERTEX_INDEX_FORMAT);
 
             render_pass.draw_indexed(0..mesh.num_indices(), 0, 0..num_instances as u32);
+            Context::count_draw_call();
         }
 
         // Render wireframe (thick lines using polyline technique)
@@ -3560,6 +3561,7 @@ impl Material3d for ObjectMaterial {
                 // Draw: 6 vertices per edge (computed from vertex_index), num_instances instances
                 let num_vertices = (num_edges * 6) as u32;
                 render_pass.draw(0..num_vertices, 0..num_instances as u32);
+                Context::count_draw_call();
             }
         }
 
@@ -3672,6 +3674,7 @@ impl Material3d for ObjectMaterial {
                 // Draw: 6 vertices per point (computed from vertex_index), num_instances instances
                 let num_draw_vertices = (num_vertices * 6) as u32;
                 render_pass.draw(0..num_draw_vertices, 0..num_instances as u32);
+                Context::count_draw_call();
             }
         }
     }

@@ -572,5 +572,6 @@ impl Material2d for SkinnedMaterial2d {
         render_pass.set_vertex_buffer(3, self.buffers.weights.slice(..));
         render_pass.set_index_buffer(self.buffers.index.slice(..), VERTEX_INDEX_FORMAT);
         render_pass.draw_indexed(0..self.buffers.num_indices, 0, 0..1);
+        Context::count_draw_call();
     }
 }

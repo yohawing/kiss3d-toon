@@ -426,6 +426,7 @@ impl Renderer3d for PolylineRenderer3d {
         // Draw all polylines in a single call
         let num_segments = self.segments.len() as u32;
         render_pass.draw(0..6, 0..num_segments);
+        Context::count_draw_call();
 
         // Clear segments for next frame
         self.segments.clear();

@@ -357,6 +357,7 @@ impl PolylineRenderer2d {
 
             // Single draw call: 6 vertices per segment (2 triangles), all segments as instances
             render_pass.draw(0..6, 0..self.segments.len() as u32);
+            Context::count_draw_call();
         }
 
         // Clear segments for next frame

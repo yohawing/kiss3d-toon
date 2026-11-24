@@ -931,6 +931,7 @@ impl Gi2d {
         }
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
+        Context::count_draw_call();
     }
 
     /// Bakes the occluder distance field for this frame (seed → jump-flood → resolve).

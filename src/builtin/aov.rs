@@ -395,6 +395,7 @@ impl AovRenderer {
             pass.set_vertex_buffer(1, item.normals.slice(..));
             pass.set_index_buffer(item.faces.slice(..), VERTEX_INDEX_FORMAT);
             pass.draw_indexed(0..item.num_indices, 0, 0..1);
+            Context::count_draw_call();
         }
     }
 
@@ -675,5 +676,6 @@ impl AovVisualize {
         });
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
+        Context::count_draw_call();
     }
 }

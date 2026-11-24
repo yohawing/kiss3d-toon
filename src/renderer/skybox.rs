@@ -296,5 +296,6 @@ impl Skybox {
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
+        Context::count_draw_call();
     }
 }

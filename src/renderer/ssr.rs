@@ -410,6 +410,7 @@ impl Ssr {
         pass.set_pipeline(&self.ssr_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
+        Context::count_draw_call();
     }
 
     /// Box-downsamples `scene_view` into the reflection mip chain (mip 0 = a copy
@@ -475,6 +476,7 @@ impl Ssr {
             pass.set_pipeline(&self.downsample_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
     }
 }

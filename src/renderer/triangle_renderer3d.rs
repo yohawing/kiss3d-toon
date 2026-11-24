@@ -213,6 +213,7 @@ impl Renderer3d for TriangleRenderer3d {
         render_pass.set_pipeline(&self.pipeline.get(context.sample_count));
         render_pass.set_bind_group(0, &bind_group, &[]);
         render_pass.draw(0..self.vertices.len() as u32, 0..1);
+        Context::count_draw_call();
         self.vertices.clear();
     }
 }

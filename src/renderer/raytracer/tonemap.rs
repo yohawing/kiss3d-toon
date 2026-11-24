@@ -291,5 +291,6 @@ impl Tonemap {
         render_pass.set_bind_group(0, &bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.draw(0..4, 0..1);
+        Context::count_draw_call();
     }
 }

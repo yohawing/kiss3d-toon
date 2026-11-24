@@ -1322,6 +1322,7 @@ impl HdrPipeline {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
+        Context::count_draw_call();
     }
 
     /// Mutable access to the HDR finishing settings.
@@ -1404,6 +1405,7 @@ impl HdrPipeline {
             pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..4, 0..1);
+            Context::count_draw_call();
         }
 
         // Downsample down the chain: mip[i] -> mip[i+1].
@@ -1432,6 +1434,7 @@ impl HdrPipeline {
             pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..4, 0..1);
+            Context::count_draw_call();
         }
 
         // Upsample back up the chain, additively blending: mip[i+1] -> mip[i].
@@ -1461,6 +1464,7 @@ impl HdrPipeline {
             pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..4, 0..1);
+            Context::count_draw_call();
         }
     }
 
@@ -1539,6 +1543,7 @@ impl HdrPipeline {
             pass.set_pipeline(&self.meter_pipeline);
             pass.set_bind_group(0, &meter_bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
 
         // Adaptation pass: (meter, prev exposure) -> new exposure.
@@ -1585,6 +1590,7 @@ impl HdrPipeline {
             pass.set_pipeline(&self.adapt_pipeline);
             pass.set_bind_group(0, &adapt_bg, &[]);
             pass.draw(0..3, 0..1);
+            Context::count_draw_call();
         }
 
         // The texture just written is read this frame; ping-pong for the next.
@@ -1744,5 +1750,6 @@ impl HdrPipeline {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
+        Context::count_draw_call();
     }
 }
