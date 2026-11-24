@@ -1,6 +1,6 @@
 //! Screenshot functionality.
 
-use image::{imageops, ImageBuffer, Rgb};
+use image::{imageops, ImageBuffer, Rgb, Rgba};
 
 use super::Window;
 
@@ -92,6 +92,24 @@ impl Window {
         let img_opt = ImageBuffer::from_vec(width, height, buf);
         let img = img_opt.expect("Buffer created from window was not big enough for image.");
         imageops::flip_vertical(&img)
+    }
+
+    /// Captures the last rendered frame of a hidden / headless window with its
+    /// alpha channel (top-left origin, like [`Self::snap_image`]).
+    ///
+    /// Off-screen frames forward the scene alpha instead of forcing it opaque,
+    /// so a transparent background color leaves uncovered pixels transparent.
+    /// Returns `None` for a visible window, whose surface output is opaque.
+    pub fn snap_rgba_image(&self) -> Option<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+        let tex = self.direct_offscreen_texture()?;
+        let (width, height) = self.canvas.size();
+        self.canvas
+            .begin_read_pixels_from_texture(tex, 0, 0, width as usize, height as usize);
+        let mut buf = Vec::new();
+        let (width, height) = self.canvas.finish_read_pixels_rgba(&mut buf)?;
+        let img = ImageBuffer::from_vec(width, height, buf)
+            .expect("readback buffer was not big enough for image");
+        Some(imageops::flip_vertical(&img))
     }
 
     /// Starts a non-blocking capture of the last rendered frame.

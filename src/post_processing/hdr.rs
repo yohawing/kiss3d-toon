@@ -1001,14 +1001,17 @@ impl HdrPipeline {
                             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                             operation: wgpu::BlendOperation::Add,
                         },
-                        // Keep the destination alpha (out.a = dst.a). The opaque
-                        // scene's alpha is forwarded to the surface by the tonemap;
-                        // overwriting it with the OIT coverage (1 - reveal) drove it
-                        // to 0 on the background and made the canvas transparent →
-                        // white page on browsers that composite canvas alpha (Firefox).
+                        // Composite the OIT coverage over the destination alpha
+                        // (out.a = cov + dst.a·(1 - cov)). Where no transparent
+                        // surface is drawn (cov = 0) the opaque scene's alpha is
+                        // kept; overwriting it with the coverage (1 - reveal)
+                        // drove it to 0 on the background and made the canvas
+                        // transparent → white page on browsers that composite
+                        // canvas alpha (Firefox). Off-screen captures with a
+                        // transparent background keep transparent surfaces.
                         alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::Zero,
-                            dst_factor: wgpu::BlendFactor::One,
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                             operation: wgpu::BlendOperation::Add,
                         },
                     }),

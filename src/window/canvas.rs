@@ -416,4 +416,9 @@ impl Canvas {
     pub fn finish_read_pixels(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         self.canvas.finish_read_pixels(out)
     }
+
+    /// Like [`Self::finish_read_pixels`], but returns RGBA data (4 bytes per pixel).
+    pub fn finish_read_pixels_rgba(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.canvas.finish_read_pixels_rgba(out)
+    }
 }
