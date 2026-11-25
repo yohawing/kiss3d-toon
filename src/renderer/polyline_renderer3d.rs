@@ -317,11 +317,26 @@ impl PolylineRenderer3d {
 
     /// Draws a simple line segment with the given width.
     pub fn draw_line(&mut self, a: Vec3, b: Vec3, color: Color, width: f32, perspective: bool) {
+        self.draw_line_with_depth_bias(a, b, color, width, perspective, 0.0);
+    }
+
+    /// Draws a simple line segment with an explicit clip-space depth bias.
+    /// Positive values move the segment toward the camera, which is useful for
+    /// editor overlays that must remain readable through scene geometry.
+    pub fn draw_line_with_depth_bias(
+        &mut self,
+        a: Vec3,
+        b: Vec3,
+        color: Color,
+        width: f32,
+        perspective: bool,
+        depth_bias: f32,
+    ) {
         self.segments.push(LineSegment {
             point_a: a.into(),
             width,
             point_b: b.into(),
-            depth_bias: 0.0,
+            depth_bias,
             color: [color.r, color.g, color.b, color.a],
             perspective: perspective as u32,
             _padding: [0; 3],
