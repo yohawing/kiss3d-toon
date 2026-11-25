@@ -164,6 +164,14 @@ fn with_globals<R>(f: impl FnOnce(&DeformGlobals) -> R) -> R {
     })
 }
 
+/// Releases shared deform GPU resources before the owning wgpu context is reset.
+pub(crate) fn reset_globals() {
+    GLOBALS.with(|cell| {
+        let globals = cell.borrow_mut().take();
+        drop(globals);
+    });
+}
+
 /// The shared deform bind-group layout, used as group 4 of the color/prepass
 /// pipelines and group 2 of the shadow pipelines. All these pipelines reference the
 /// *same* layout object, so one per-object bind group works in every pass.

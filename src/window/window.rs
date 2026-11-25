@@ -1207,15 +1207,19 @@ impl Drop for Window {
         let is_last_window = Context::decrement_window_count();
 
         if is_last_window {
-            // The order matters: clear caches first (which hold references to GPU resources),
-            // then clear the Context (which holds the wgpu Device/Queue/Instance).
+            // The order matters: the 2D managers are lazily initialized and their default
+            // material reaches into WindowCache's texture manager during construction. Keep
+            // WindowCache alive until both managers have been reset, then release the 3D
+            // cache and finally the Context (which owns the wgpu Device/Queue/Instance).
 
-            // Clear 3D resource managers
-            WindowCache::reset();
-
-            // Clear 2D resource managers
+            // Clear standalone GPU globals and 2D resource managers while their
+            // WindowCache dependencies are available.
+            crate::builtin::deform::reset_globals();
             MeshManager2d::reset_global_manager();
             MaterialManager2d::reset_global_manager();
+
+            // Clear 3D resource managers.
+            WindowCache::reset();
 
             // Finally, clear the wgpu context itself
             Context::reset();
