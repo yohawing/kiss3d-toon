@@ -1151,8 +1151,8 @@ fn shade(in: VertexOutput) -> vec4<f32> {
     @if(mr_map) {
         let mr = textureSample(t_metallic_roughness, s_metallic_roughness, uv);
         // glTF convention: B = metallic, G = roughness
-        metallic = mr.b;
-        roughness = mr.g;
+        metallic *= mr.b;
+        roughness *= mr.g;
     }
 
     // Clamp roughness to prevent artifacts
