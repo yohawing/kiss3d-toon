@@ -33,6 +33,7 @@ use winit::window::WindowAttributes;
 pub(super) use super::egui_integration::EguiContext;
 #[cfg(feature = "recording")]
 pub(super) use super::recording::RecordingState;
+use super::viewport::{RenderViewport, ViewportCompositor};
 use super::window_cache::WindowCache;
 
 pub(super) static DEFAULT_WIDTH: u32 = 800u32;
@@ -44,6 +45,50 @@ pub(super) static DEFAULT_HEIGHT: u32 = 600u32;
 /// [`Window::set_shadow_resolution`] for crisper shadows, lower it to save memory
 /// and fill (the atlas is `resolution² × MAX_SHADOW_VIEWS`).
 pub(super) static DEFAULT_SHADOW_RESOLUTION: u32 = 2048u32;
+
+/// Why a surface frame was skipped without making the renderer unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceSkipReason {
+    Timeout,
+    Occluded,
+    OutdatedAfterReconfigure,
+    ZeroSizedSurface,
+}
+
+/// Why a visible surface can no longer be used by the raster renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceUnavailableReason {
+    Lost,
+    Validation,
+    MissingSurface,
+}
+
+/// Outcome of one raster 3D frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderFrameStatus {
+    Presented { suboptimal: bool },
+    Skipped(SurfaceSkipReason),
+    SurfaceUnavailable(SurfaceUnavailableReason),
+    Closed,
+}
+
+impl RenderFrameStatus {
+    /// Preserve the historical bool API: only a closed window stops the loop.
+    pub(crate) fn should_continue(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
+/// Internal surface acquisition result. The texture is kept private to the
+/// window module boundary; callers only receive the public frame status.
+pub(crate) enum SurfaceAcquire {
+    Ready {
+        texture: wgpu::SurfaceTexture,
+        suboptimal: bool,
+    },
+    Skip(SurfaceSkipReason),
+    Unavailable(SurfaceUnavailableReason),
+}
 
 /// Structure representing a window and a 3D scene.
 ///
@@ -110,6 +155,10 @@ pub struct Window {
     /// Offscreen render target used when the window is hidden, so `snap` and
     /// recording work without a presentable surface. Created on first use.
     pub(super) offscreen_output_target: Option<RenderTarget>,
+    /// Optional physical-pixel sub-viewport for embedded rendering. The full
+    /// scene is rendered offscreen at this size and composited into the surface.
+    pub(super) render_viewport: Option<RenderViewport>,
+    pub(super) viewport_compositor: ViewportCompositor,
     /// Renderer for auxiliary outputs (depth, normals, segmentation). Created
     /// on first use of an AOV-producing method.
     pub(super) aov_renderer: Option<crate::builtin::AovRenderer>,
@@ -1100,6 +1149,8 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            render_viewport: None,
+            viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             hidden: hide,
             shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
@@ -1125,6 +1176,83 @@ impl Window {
     /// themselves and never present to a display.
     pub async fn new_headless_with_setup(width: u32, height: u32, setup: CanvasSetup) -> Window {
         Self::do_new_headless(width, height, Some(setup)).await
+    }
+
+    /// Creates a full-featured window on a surface supplied by an embedding
+    /// application, without creating or polling a winit event loop.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn new_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        setup: CanvasSetup,
+    ) -> Window
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        let (event_send, event_receive) = mpsc::channel();
+        let canvas =
+            Canvas::open_embedded(surface_target, width, height, Some(setup), event_send).await;
+        let (width, height) = canvas.size();
+        let canvas_surface_format = canvas.surface_format();
+
+        Context::increment_window_count();
+        WindowCache::populate();
+
+        let framebuffer_manager = FramebufferManager::new();
+        Window {
+            should_close: false,
+            first_frame: true,
+            close_key: None,
+            close_modifiers: None,
+            last_timings: None,
+            last_frame_instant: None,
+            gpu_timer: GpuTimer::new(),
+            canvas,
+            events: Rc::new(event_receive),
+            unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            ambient_intensity: 0.2,
+            ambient_color: crate::color::WHITE,
+            fog: crate::light::Fog::default(),
+            background: BLACK,
+            polyline_renderer_2d: PolylineRenderer2d::new(),
+            point_renderer_2d: PointRenderer2d::new(),
+            point_renderer: PointRenderer3d::new(),
+            polyline_renderer: PolylineRenderer3d::new(),
+            text_renderer: TextRenderer::new(),
+            #[cfg(feature = "egui")]
+            egui_context: EguiContext::new(),
+            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            skybox: crate::renderer::Skybox::new(),
+            ssao: None,
+            ssao_enabled: false,
+            clustered: None,
+            reflection_probes: None,
+            probe_capture: None,
+            pending_probe_captures: Vec::new(),
+            reflection_capture_layers: u32::MAX,
+            ssr: None,
+            ssr_enabled: false,
+            dof: None,
+            dof_enabled: false,
+            transmission: None,
+            transmission_enabled: true,
+            reflector_oit: None,
+            post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
+            post_process_render_target_b: framebuffer_manager
+                .new_render_target(width, height, false),
+            offscreen_output_target: None,
+            render_viewport: None,
+            viewport_compositor: ViewportCompositor::new(canvas_surface_format),
+            aov_renderer: None,
+            hidden: false,
+            shadow_mapper: ShadowMapper::new(DEFAULT_SHADOW_RESOLUTION),
+            framebuffer_manager,
+            #[cfg(feature = "recording")]
+            recording: None,
+            #[cfg(feature = "rt_switcher")]
+            raytracer: (None, false),
+        }
     }
 
     /// Creates a headless window: a render target backed by no actual window,
@@ -1186,6 +1314,8 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             offscreen_output_target: None,
+            render_viewport: None,
+            viewport_compositor: ViewportCompositor::new(canvas_surface_format),
             aov_renderer: None,
             // A headless window has no surface; always render off-screen.
             hidden: true,

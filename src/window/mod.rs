@@ -15,6 +15,7 @@ mod offscreen;
 mod recording;
 mod rendering;
 mod screenshot;
+mod viewport;
 mod wgpu_canvas;
 mod window;
 mod window_cache;
@@ -27,8 +28,10 @@ pub use ios::run_ios;
 pub use offscreen::OffscreenSurface;
 #[cfg(feature = "recording")]
 pub use recording::RecordingConfig;
+pub use viewport::RenderViewport;
 #[cfg(target_os = "android")]
 pub use wgpu_canvas::init_android;
 pub use wgpu_canvas::WgpuCanvas;
-pub use window::Window;
+pub(crate) use window::SurfaceAcquire;
+pub use window::{RenderFrameStatus, SurfaceSkipReason, SurfaceUnavailableReason, Window};
 pub(crate) use window_cache::WINDOW_CACHE;

@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 
 use crate::event::{Action, Key, MouseButton, WindowEvent};
-use crate::window::WgpuCanvas;
+use crate::window::{SurfaceAcquire, WgpuCanvas};
 use image::{GenericImage, Pixel};
 use winit::window::WindowAttributes;
 
@@ -95,6 +95,30 @@ impl Canvas {
         }
     }
 
+    /// Opens a canvas on a surface supplied by an embedding application.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Self
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        Canvas {
+            canvas: WgpuCanvas::open_embedded(
+                surface_target,
+                width,
+                height,
+                canvas_setup,
+                out_events,
+            )
+            .await,
+        }
+    }
+
     /// Poll all events that occurred since the last call to this method.
     pub fn poll_events(&mut self) {
         self.canvas.poll_events()
@@ -105,9 +129,19 @@ impl Canvas {
         self.canvas.resize(width, height)
     }
 
+    /// Explicit same-size surface recovery for embedding hosts.
+    pub fn reconfigure_surface(&self) {
+        self.canvas.reconfigure_surface()
+    }
+
     /// Gets the current surface texture for rendering.
     pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
         self.canvas.get_current_texture()
+    }
+
+    /// Gets the current surface texture and preserves its wgpu acquisition outcome.
+    pub(crate) fn get_current_texture_status(&self) -> SurfaceAcquire {
+        self.canvas.get_current_texture_status()
     }
 
     /// Presents the current frame.

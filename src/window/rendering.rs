@@ -16,7 +16,7 @@ use crate::resource::{
 };
 use crate::scene::{SceneNode2d, SceneNode3d};
 
-use super::Window;
+use super::{RenderFrameStatus, SurfaceAcquire, Window};
 
 /// Grace period during which the first frame keeps retrying surface acquisition
 /// before giving up. A freshly created window — particularly on macOS — may need
@@ -28,7 +28,27 @@ const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+fn should_retry_surface_startup(outcome: &SurfaceAcquire) -> bool {
+    !matches!(outcome, SurfaceAcquire::Unavailable(_))
+}
+
 impl Window {
+    /// Renders one raster 3D frame and preserves the surface outcome.
+    ///
+    /// This status API is one-shot for surface acquisition and never enters the
+    /// optional ray-tracing switcher path. A transient acquisition result is
+    /// returned to the caller for that frame.
+    pub async fn render_3d_status(
+        &mut self,
+        scene: &mut SceneNode3d,
+        camera: &mut impl Camera3d,
+    ) -> RenderFrameStatus {
+        let mut default_cam2 = FixedView2d::default();
+        self.handle_events(camera, &mut default_cam2);
+        self.render_single_frame_status(Some(scene), None, camera, &mut default_cam2, None, &mut [])
+            .await
+    }
+
     /// Renders one frame of a 3D scene.
     ///
     /// This is the main rendering function that should be called in your render loop.
@@ -60,9 +80,19 @@ impl Window {
     /// # Platform-specific
     /// - **Native**: Returns immediately after rendering one frame
     /// - **WASM**: Yields to the browser's event loop and returns when the next frame is ready
+    ///
+    /// The optional `rt_switcher` feature preserves its historical render/raytrace
+    /// dispatch. Without it, this bool API projects the raster status result.
     pub async fn render_3d(&mut self, scene: &mut SceneNode3d, camera: &mut impl Camera3d) -> bool {
-        self.render(Some(scene), None, Some(camera), None, None, None)
-            .await
+        #[cfg(feature = "rt_switcher")]
+        {
+            self.render(Some(scene), None, Some(camera), None, None, None)
+                .await
+        }
+        #[cfg(not(feature = "rt_switcher"))]
+        {
+            self.render_3d_status(scene, camera).await.should_continue()
+        }
     }
 
     pub async fn render_2d(&mut self, scene: &mut SceneNode2d, camera: &mut impl Camera2d) -> bool {
@@ -188,13 +218,34 @@ impl Window {
 
     async fn render_single_frame(
         &mut self,
+        scene: Option<&mut SceneNode3d>,
+        scene_2d: Option<&mut SceneNode2d>,
+        camera: &mut dyn Camera3d,
+        camera_2d: &mut dyn Camera2d,
+        renderer: Option<&mut dyn Renderer3d>,
+        post_processing: &mut [&mut dyn PostProcessingEffect],
+    ) -> bool {
+        self.render_single_frame_status(
+            scene,
+            scene_2d,
+            camera,
+            camera_2d,
+            renderer,
+            post_processing,
+        )
+        .await
+        .should_continue()
+    }
+
+    async fn render_single_frame_status(
+        &mut self,
         mut scene: Option<&mut SceneNode3d>,
         mut scene_2d: Option<&mut SceneNode2d>,
         camera: &mut dyn Camera3d,
         camera_2d: &mut dyn Camera2d,
         mut renderer: Option<&mut dyn Renderer3d>,
         post_processing: &mut [&mut dyn PostProcessingEffect],
-    ) -> bool {
+    ) -> RenderFrameStatus {
         // Frame timing: CPU wall-clock for the whole frame (and submit/present
         // below) plus per-pass GPU timestamps recorded into the GPU timer. The
         // frame-to-frame wall-clock period (true FPS) is the delta between
@@ -217,22 +268,67 @@ impl Window {
         // Acquire the surface texture for visible windows. A just-created
         // window may not be presentable yet, so `acquire_next_frame` retries
         // until it is.
-        let frame = if offscreen {
-            None
+        let (frame, suboptimal) = if offscreen {
+            (None, false)
         } else {
-            match self.acquire_next_frame() {
-                Some(frame) => Some(frame),
-                None => {
+            match self.acquire_next_frame_status() {
+                SurfaceAcquire::Ready {
+                    texture,
+                    suboptimal,
+                } => (Some(texture), suboptimal),
+                SurfaceAcquire::Skip(reason) => {
                     self.discard_queued_draws();
-                    return !self.should_close();
+                    return if self.should_close() {
+                        RenderFrameStatus::Closed
+                    } else {
+                        RenderFrameStatus::Skipped(reason)
+                    };
+                }
+                SurfaceAcquire::Unavailable(reason) => {
+                    self.discard_queued_draws();
+                    return if self.should_close() {
+                        RenderFrameStatus::Closed
+                    } else {
+                        RenderFrameStatus::SurfaceUnavailable(reason)
+                    };
                 }
             }
         };
 
-        // Read the size only now: while retrying, a pending resize event may
-        // have been processed and the surface reconfigured.
-        let w = self.width();
-        let h = self.height();
+        // Read the surface size only now: while retrying, a pending resize
+        // event may have been processed and the surface reconfigured.
+        let surface_w = self.width();
+        let surface_h = self.height();
+        let configured_viewport = !offscreen && self.render_viewport.is_some();
+        let render_viewport = if offscreen {
+            None
+        } else {
+            self.render_viewport
+                .and_then(|viewport| viewport.clamp(surface_w, surface_h))
+        };
+
+        // A configured zero-size or fully clipped viewport renders nothing and
+        // clears the surface, preventing pixels from the previous layout from
+        // leaking behind DOM panels.
+        if configured_viewport && render_viewport.is_none() {
+            self.discard_queued_draws();
+            let frame = frame.expect("visible windows acquire a surface frame");
+            let surface_view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.viewport_compositor.clear(&surface_view);
+            self.canvas.copy_frame_to_readback(&frame);
+            self.canvas.present(frame);
+            return if self.should_close() {
+                RenderFrameStatus::Closed
+            } else {
+                RenderFrameStatus::Presented { suboptimal }
+            };
+        }
+
+        let (w, h) = render_viewport
+            .map(|viewport| (viewport.width, viewport.height))
+            .unwrap_or((surface_w, surface_h));
 
         camera_2d.handle_event(&self.canvas, &WindowEvent::FramebufferSize(w, h));
         camera.handle_event(&self.canvas, &WindowEvent::FramebufferSize(w, h));
@@ -242,11 +338,12 @@ impl Window {
         // No need to update the light position here - it's computed per-frame
         // in the material's prepare() based on the camera position
 
-        // The scene is rasterized into the HDR film, whose sample count follows
-        // the canvas (a headless canvas included: `OffscreenSurface::set_samples`
-        // and `CanvasSetup::samples`); the film is resolved before tonemapping,
-        // so the single-sample offscreen output target is unaffected.
-        let sample_count = self.canvas.sample_count();
+        let render_offscreen = offscreen || render_viewport.is_some();
+        let sample_count = if render_viewport.is_some() {
+            1
+        } else {
+            self.canvas.sample_count()
+        };
 
         let ctxt = Context::get();
         let mut encoder = ctxt.create_command_encoder(Some("kiss3d_frame_encoder"));
@@ -263,7 +360,7 @@ impl Window {
             .resize(w, h, self.canvas.surface_format());
         self.post_process_render_target_b
             .resize(w, h, self.canvas.surface_format());
-        if offscreen {
+        if render_offscreen {
             if self.offscreen_output_target.is_none() {
                 self.offscreen_output_target =
                     Some(self.framebuffer_manager.new_render_target(w, h, true));
@@ -275,19 +372,27 @@ impl Window {
             );
         }
 
-        // The view that receives the final composited image: the surface
-        // texture for a visible window, the offscreen color texture otherwise.
-        let frame_view = match &frame {
-            Some(frame) => frame
+        let surface_view = frame.as_ref().map(|frame| {
+            frame
                 .texture
-                .create_view(&wgpu::TextureViewDescriptor::default()),
-            None => self
-                .offscreen_output_target
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
+
+        // A partial viewport renders every pass into a viewport-sized target,
+        // preserving post effects and screen-space math. The final image is
+        // composited into the full surface below.
+        let frame_view = if render_offscreen {
+            self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
                 .color_view()
                 .expect("offscreen render target is never the screen")
-                .clone(),
+                .clone()
+        } else {
+            surface_view
+                .as_ref()
+                .expect("visible full-surface render has a surface view")
+                .clone()
         };
 
         // The rasterized scene always renders into the HDR film. `color_view` is
@@ -297,11 +402,18 @@ impl Window {
         let color_view = self.hdr.scene_render_view().clone();
         let resolve_view = self.hdr.scene_resolve_view().cloned();
 
-        // The depth attachment must match the scene target's sample count: the
-        // canvas depth texture is built MSAA-aware for windows and headless
-        // canvases alike (the offscreen output target's depth stays single-sample
-        // for the AOV and readback paths).
-        let depth_view = self.canvas.depth_view().clone();
+        // Partial viewports use their own single-sample depth; full-size and
+        // headless rendering use the canvas depth with its configured MSAA.
+        let depth_view = if render_viewport.is_some() {
+            self.offscreen_output_target
+                .as_ref()
+                .expect("offscreen render target was just created")
+                .depth_view()
+                .expect("offscreen render target is never the screen")
+                .clone()
+        } else {
+            self.canvas.depth_view().clone()
+        };
 
         // Clear the render target at the start of the frame
         {
@@ -1257,6 +1369,16 @@ impl Window {
             );
         }
 
+        if let Some(viewport) = render_viewport {
+            self.viewport_compositor.composite(
+                &frame_view,
+                surface_view
+                    .as_ref()
+                    .expect("partial viewport rendering has a surface view"),
+                viewport,
+            );
+        }
+
         // Copy the rendered image into the readback texture so `snap`,
         // `snap_rect` and recording can read it back.
         match &frame {
@@ -1320,7 +1442,11 @@ impl Window {
         #[cfg(target_os = "ios")]
         super::ios::next_frame().await;
 
-        !self.should_close()
+        if self.should_close() {
+            RenderFrameStatus::Closed
+        } else {
+            RenderFrameStatus::Presented { suboptimal }
+        }
     }
 
     /// Renders one path-traced frame.
@@ -1582,14 +1708,14 @@ impl Window {
     /// acquired, a later failure (e.g. a minimized window) skips the frame
     /// immediately instead of stalling.
     fn acquire_next_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
-        if let Some(frame) = self.canvas.get_current_texture() {
-            self.first_frame = false;
-            return Some(frame);
+        let initial = self.acquire_next_frame_status();
+        if let SurfaceAcquire::Ready { texture, .. } = initial {
+            return Some(texture);
         }
 
-        // The window has rendered before: treat this as a transient failure
-        // and skip the frame without stalling.
-        if !self.first_frame {
+        // Preserve the historical startup grace period for private non-status
+        // callers, but never retry an unavailable surface.
+        if !self.first_frame || !should_retry_surface_startup(&initial) {
             return None;
         }
 
@@ -1606,9 +1732,13 @@ impl Window {
                 std::thread::sleep(SURFACE_RETRY_INTERVAL);
                 self.canvas.poll_events();
 
-                if let Some(frame) = self.canvas.get_current_texture() {
+                let outcome = self.canvas.get_current_texture_status();
+                if let SurfaceAcquire::Ready { texture, .. } = outcome {
                     self.first_frame = false;
-                    return Some(frame);
+                    return Some(texture);
+                }
+                if !should_retry_surface_startup(&outcome) {
+                    return None;
                 }
 
                 if std::time::Instant::now() >= deadline {
@@ -1620,6 +1750,15 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// Performs one classified surface acquisition without startup waiting.
+    fn acquire_next_frame_status(&mut self) -> SurfaceAcquire {
+        let outcome = self.canvas.get_current_texture_status();
+        if matches!(outcome, SurfaceAcquire::Ready { .. }) {
+            self.first_frame = false;
+        }
+        outcome
     }
 
     fn render_scene(
@@ -1980,5 +2119,30 @@ impl Window {
             .color_view()
             .expect("offscreen render target is never the screen")
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::{SurfaceSkipReason, SurfaceUnavailableReason};
+
+    #[test]
+    fn startup_surface_policy_retries_skips_but_never_unavailable() {
+        assert!(should_retry_surface_startup(&SurfaceAcquire::Skip(
+            SurfaceSkipReason::Timeout,
+        )));
+        assert!(should_retry_surface_startup(&SurfaceAcquire::Skip(
+            SurfaceSkipReason::ZeroSizedSurface,
+        )));
+        assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
+            SurfaceUnavailableReason::MissingSurface
+        )));
+        assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
+            SurfaceUnavailableReason::Lost
+        )));
+        assert!(!should_retry_surface_startup(&SurfaceAcquire::Unavailable(
+            SurfaceUnavailableReason::Validation
+        )));
     }
 }

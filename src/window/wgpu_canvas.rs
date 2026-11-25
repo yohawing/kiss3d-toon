@@ -1,12 +1,13 @@
 //! Unified wgpu-based canvas for both native and web platforms.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::context::Context;
 use crate::event::{Action, Key, Modifiers, MouseButton, TouchAction, WindowEvent};
 use crate::window::canvas::CanvasSetup;
+use crate::window::{SurfaceAcquire, SurfaceSkipReason, SurfaceUnavailableReason};
 use image::{GenericImage, Pixel};
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 use winit::application::ApplicationHandler;
@@ -253,6 +254,50 @@ struct PendingSnap {
     padded_bytes_per_row: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceAcquireKind {
+    Success,
+    Suboptimal,
+    Timeout,
+    Occluded,
+    Outdated,
+    Lost,
+    Validation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceAcquireDecision {
+    Ready { suboptimal: bool },
+    RetryOutdated,
+    Skip(SurfaceSkipReason),
+    Unavailable(SurfaceUnavailableReason),
+}
+
+/// Pure mapping for the wgpu 30 surface contract. Keeping this separate from
+/// `SurfaceTexture` makes every variant and the one-retry limit testable without
+/// a real GPU surface.
+pub(crate) fn classify_surface_acquire(
+    kind: SurfaceAcquireKind,
+    reconfigured: bool,
+) -> SurfaceAcquireDecision {
+    match kind {
+        SurfaceAcquireKind::Success => SurfaceAcquireDecision::Ready { suboptimal: false },
+        SurfaceAcquireKind::Suboptimal => SurfaceAcquireDecision::Ready { suboptimal: true },
+        SurfaceAcquireKind::Timeout => SurfaceAcquireDecision::Skip(SurfaceSkipReason::Timeout),
+        SurfaceAcquireKind::Occluded => SurfaceAcquireDecision::Skip(SurfaceSkipReason::Occluded),
+        SurfaceAcquireKind::Outdated if !reconfigured => SurfaceAcquireDecision::RetryOutdated,
+        SurfaceAcquireKind::Outdated => {
+            SurfaceAcquireDecision::Skip(SurfaceSkipReason::OutdatedAfterReconfigure)
+        }
+        SurfaceAcquireKind::Lost => {
+            SurfaceAcquireDecision::Unavailable(SurfaceUnavailableReason::Lost)
+        }
+        SurfaceAcquireKind::Validation => {
+            SurfaceAcquireDecision::Unavailable(SurfaceUnavailableReason::Validation)
+        }
+    }
+}
+
 /// A unified canvas based on wgpu that works on both native and web platforms.
 #[allow(dead_code)]
 pub struct WgpuCanvas {
@@ -280,6 +325,8 @@ pub struct WgpuCanvas {
     screenshot_staging: RefCell<Option<wgpu::Buffer>>,
     /// Readback started by `begin_read_pixels`, completed by `finish_read_pixels`.
     snap_pending: RefCell<Option<PendingSnap>>,
+    /// A suboptimal frame requests reconfiguration before the next acquire.
+    reconfigure_after_present: Cell<bool>,
     /// Pending events from web callbacks (WASM only)
     #[cfg(target_arch = "wasm32")]
     pending_events: Rc<RefCell<Vec<WindowEvent>>>,
@@ -919,10 +966,155 @@ impl WgpuCanvas {
             readback_texture,
             screenshot_staging: RefCell::new(None),
             snap_pending: RefCell::new(None),
+            reconfigure_after_present: Cell::new(false),
             #[cfg(target_arch = "wasm32")]
             pending_events,
             #[cfg(target_arch = "wasm32")]
             _event_closures,
+        }
+    }
+
+    /// Opens a canvas on a surface owned by an embedding application.
+    ///
+    /// Unlike [`Self::open`], this does not create or poll a winit event loop.
+    /// The embedder remains responsible for the native window lifetime and
+    /// resize notifications.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_embedded<T>(
+        surface_target: T,
+        width: u32,
+        height: u32,
+        canvas_setup: Option<CanvasSetup>,
+        out_events: Sender<WindowEvent>,
+    ) -> Self
+    where
+        T: Into<wgpu::SurfaceTarget<'static>>,
+    {
+        let canvas_setup = canvas_setup.unwrap_or_default();
+        let width = width.max(1);
+        let height = height.max(1);
+
+        let (surface, surface_format) = if Context::is_initialized() {
+            let ctxt = Context::get();
+            let surface = ctxt
+                .instance
+                .create_surface(surface_target)
+                .expect("Failed to create embedded surface");
+            let surface_caps = surface.get_capabilities(&ctxt.adapter);
+            let enabled_features = ctxt.device.features();
+            let surface_format = surface_caps
+                .formats
+                .iter()
+                .find(|format| {
+                    !format.is_srgb() && enabled_features.contains(format.required_features())
+                })
+                .copied()
+                .unwrap_or(surface_caps.formats[0]);
+            (surface, surface_format)
+        } else {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let surface = instance
+                .create_surface(surface_target)
+                .expect("Failed to create embedded surface");
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::default(),
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .expect("Failed to find an adapter for the embedded surface");
+            let required_features = device_features(&adapter, canvas_setup.required_features);
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("kiss3d embedded device"),
+                    required_features,
+                    required_limits: adapter.limits(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                    experimental_features: experimental_features(required_features),
+                })
+                .await
+                .expect("Failed to create the embedded device");
+            let surface_caps = surface.get_capabilities(&adapter);
+            let enabled_features = device.features();
+            let surface_format = surface_caps
+                .formats
+                .iter()
+                .find(|format| {
+                    !format.is_srgb() && enabled_features.contains(format.required_features())
+                })
+                .copied()
+                .unwrap_or(surface_caps.formats[0]);
+            Context::init(instance, device, queue, adapter, surface_format);
+            (surface, surface_format)
+        };
+
+        let ctxt = Context::get();
+        let surface_caps = surface.get_capabilities(&ctxt.adapter);
+        let present_mode = if canvas_setup.vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            surface_usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: surface_usage,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width,
+            height,
+            present_mode,
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&ctxt.device, &surface_config);
+
+        let sample_count = canvas_setup.samples as u32;
+        let (depth_texture, depth_view) =
+            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+        let (msaa_texture, msaa_view) = if sample_count > 1 {
+            let (texture, view) = Self::create_msaa_texture(
+                &ctxt.device,
+                width,
+                height,
+                surface_format,
+                sample_count,
+            );
+            (Some(texture), Some(view))
+        } else {
+            (None, None)
+        };
+        let readback_texture =
+            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
+
+        WgpuCanvas {
+            window: None,
+            window_id: None,
+            surface: Some(surface),
+            surface_config,
+            cursor_pos: None,
+            key_states: [Action::Release; Key::Unknown as usize + 1],
+            button_states: [Action::Release; MouseButton::Button8 as usize + 1],
+            out_events,
+            modifiers_state: ModifiersState::default(),
+            depth_texture,
+            depth_view,
+            msaa_texture,
+            msaa_view,
+            sample_count,
+            readback_texture,
+            screenshot_staging: RefCell::new(None),
+            snap_pending: RefCell::new(None),
+            reconfigure_after_present: Cell::new(false),
         }
     }
 
@@ -1033,6 +1225,7 @@ impl WgpuCanvas {
             readback_texture,
             screenshot_staging: RefCell::new(None),
             snap_pending: RefCell::new(None),
+            reconfigure_after_present: Cell::new(false),
             #[cfg(target_arch = "wasm32")]
             pending_events: Rc::new(RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
@@ -1103,6 +1296,13 @@ impl WgpuCanvas {
 
         self.readback_texture =
             Self::create_readback_texture(&ctxt.device, width, height, self.surface_config.format);
+    }
+
+    /// Explicit same-size surface recovery for embedding hosts.
+    pub fn reconfigure_surface(&self) {
+        if let Some(surface) = &self.surface {
+            surface.configure(&Context::get().device, &self.surface_config);
+        }
     }
 
     /// Changes the MSAA sample count, recreating the size-dependent attachments
@@ -1487,23 +1687,93 @@ impl WgpuCanvas {
         }
     }
 
-    /// Gets the current surface texture for rendering.
-    pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
-        let surface = self.surface.as_ref()?;
-        match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                // Reconfigure and retry once
+    /// Gets the current surface texture while preserving the wgpu outcome.
+    pub(crate) fn get_current_texture_status(&self) -> SurfaceAcquire {
+        // A previous Suboptimal frame is already presented by this point. Apply
+        // its deferred reconfigure before asking wgpu for the next texture.
+        if self.reconfigure_after_present.replace(false) {
+            if let Some(surface) = &self.surface {
                 let ctxt = Context::get();
                 surface.configure(&ctxt.device, &self.surface_config);
-                match surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(texture)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
-                    _ => None,
+            }
+        }
+        if self.surface_config.width == 0 || self.surface_config.height == 0 {
+            return SurfaceAcquire::Skip(SurfaceSkipReason::ZeroSizedSurface);
+        }
+        self.acquire_surface_texture(false)
+    }
+
+    fn acquire_surface_texture(&self, reconfigured: bool) -> SurfaceAcquire {
+        let Some(surface) = self.surface.as_ref() else {
+            return SurfaceAcquire::Unavailable(SurfaceUnavailableReason::MissingSurface);
+        };
+        match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => {
+                match classify_surface_acquire(SurfaceAcquireKind::Success, reconfigured) {
+                    SurfaceAcquireDecision::Ready { suboptimal } => SurfaceAcquire::Ready {
+                        texture,
+                        suboptimal,
+                    },
+                    _ => unreachable!("success must map to ready"),
                 }
             }
-            _ => None,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                self.reconfigure_after_present.set(true);
+                match classify_surface_acquire(SurfaceAcquireKind::Suboptimal, reconfigured) {
+                    SurfaceAcquireDecision::Ready { suboptimal } => SurfaceAcquire::Ready {
+                        texture,
+                        suboptimal,
+                    },
+                    _ => unreachable!("suboptimal must map to ready"),
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                match classify_surface_acquire(SurfaceAcquireKind::Timeout, reconfigured) {
+                    SurfaceAcquireDecision::Skip(reason) => SurfaceAcquire::Skip(reason),
+                    _ => unreachable!("timeout must map to skip"),
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                match classify_surface_acquire(SurfaceAcquireKind::Occluded, reconfigured) {
+                    SurfaceAcquireDecision::Skip(reason) => SurfaceAcquire::Skip(reason),
+                    _ => unreachable!("occluded must map to skip"),
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                match classify_surface_acquire(SurfaceAcquireKind::Outdated, reconfigured) {
+                    SurfaceAcquireDecision::RetryOutdated => {
+                        let ctxt = Context::get();
+                        surface.configure(&ctxt.device, &self.surface_config);
+                        self.acquire_surface_texture(true)
+                    }
+                    SurfaceAcquireDecision::Skip(reason) => SurfaceAcquire::Skip(reason),
+                    _ => unreachable!("outdated must retry once or skip"),
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                match classify_surface_acquire(SurfaceAcquireKind::Lost, reconfigured) {
+                    SurfaceAcquireDecision::Unavailable(reason) => {
+                        SurfaceAcquire::Unavailable(reason)
+                    }
+                    _ => unreachable!("lost must map to unavailable"),
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                match classify_surface_acquire(SurfaceAcquireKind::Validation, reconfigured) {
+                    SurfaceAcquireDecision::Unavailable(reason) => {
+                        SurfaceAcquire::Unavailable(reason)
+                    }
+                    _ => unreachable!("validation must map to unavailable"),
+                }
+            }
+        }
+    }
+
+    /// Gets the current surface texture for compatibility callers.
+    pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
+        match self.get_current_texture_status() {
+            SurfaceAcquire::Ready { texture, .. } => Some(texture),
+            SurfaceAcquire::Skip(_) | SurfaceAcquire::Unavailable(_) => None,
         }
     }
 
@@ -2314,6 +2584,7 @@ fn translate_web_key(code: &str) -> Key {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::window::RenderFrameStatus;
     use winit::keyboard::{Key as WinitKey, NamedKey, SmolStr};
 
     fn char_events(events: &[PendingEvent]) -> Vec<char> {
@@ -2387,5 +2658,65 @@ mod tests {
         let logical = WinitKey::Character(SmolStr::new("z"));
         let press = translate_keyboard_input(Key::Z, Action::Press, &logical, None);
         assert_eq!(char_events(&press), vec!['z']);
+    }
+
+    #[test]
+    fn surface_contract_maps_every_acquisition_variant() {
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Success, false),
+            SurfaceAcquireDecision::Ready { suboptimal: false }
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Suboptimal, false),
+            SurfaceAcquireDecision::Ready { suboptimal: true }
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Timeout, false),
+            SurfaceAcquireDecision::Skip(SurfaceSkipReason::Timeout)
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Occluded, false),
+            SurfaceAcquireDecision::Skip(SurfaceSkipReason::Occluded)
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Outdated, false),
+            SurfaceAcquireDecision::RetryOutdated
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Outdated, true),
+            SurfaceAcquireDecision::Skip(SurfaceSkipReason::OutdatedAfterReconfigure)
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Lost, false),
+            SurfaceAcquireDecision::Unavailable(SurfaceUnavailableReason::Lost)
+        );
+        assert_eq!(
+            classify_surface_acquire(SurfaceAcquireKind::Validation, false),
+            SurfaceAcquireDecision::Unavailable(SurfaceUnavailableReason::Validation)
+        );
+    }
+
+    #[test]
+    fn surface_contract_never_retries_lost_or_validation() {
+        for kind in [SurfaceAcquireKind::Lost, SurfaceAcquireKind::Validation] {
+            assert!(matches!(
+                classify_surface_acquire(kind, false),
+                SurfaceAcquireDecision::Unavailable(_)
+            ));
+            assert!(matches!(
+                classify_surface_acquire(kind, true),
+                SurfaceAcquireDecision::Unavailable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn render_status_bool_compatibility_only_stops_on_closed() {
+        assert!(RenderFrameStatus::Presented { suboptimal: false }.should_continue());
+        assert!(RenderFrameStatus::Skipped(SurfaceSkipReason::Timeout).should_continue());
+        assert!(
+            RenderFrameStatus::SurfaceUnavailable(SurfaceUnavailableReason::Lost).should_continue()
+        );
+        assert!(!RenderFrameStatus::Closed.should_continue());
     }
 }
